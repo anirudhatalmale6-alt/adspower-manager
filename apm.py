@@ -28,11 +28,60 @@ try:
 except ImportError:
     requests = None
 
-# Windows API
+# Windows API with proper 64-bit type declarations
 try:
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     psapi = ctypes.windll.psapi
+
+    HWND = ctypes.wintypes.HWND      # pointer-sized (8 bytes on x64)
+    DWORD = ctypes.wintypes.DWORD
+    BOOL = ctypes.wintypes.BOOL
+    UINT = ctypes.wintypes.UINT
+    LPARAM = ctypes.wintypes.LPARAM   # pointer-sized
+    HANDLE = ctypes.wintypes.HANDLE
+
+    # Set argtypes for all user32 functions we use
+    user32.EnumWindows.argtypes = [ctypes.c_void_p, LPARAM]
+    user32.EnumWindows.restype = BOOL
+    user32.IsWindowVisible.argtypes = [HWND]
+    user32.IsWindowVisible.restype = BOOL
+    user32.GetClassNameW.argtypes = [HWND, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [HWND, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = [HWND, ctypes.POINTER(DWORD)]
+    user32.GetWindowThreadProcessId.restype = DWORD
+    user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
+    user32.ShowWindow.restype = BOOL
+    user32.SetForegroundWindow.argtypes = [HWND]
+    user32.SetForegroundWindow.restype = BOOL
+    user32.SetWindowPos.argtypes = [HWND, HWND, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, UINT]
+    user32.SetWindowPos.restype = BOOL
+    user32.PostMessageW.argtypes = [HWND, UINT, ctypes.wintypes.WPARAM, LPARAM]
+    user32.PostMessageW.restype = BOOL
+    user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(ctypes.wintypes.RECT)]
+    user32.GetWindowRect.restype = BOOL
+    user32.OpenClipboard.argtypes = [HWND]
+    user32.OpenClipboard.restype = BOOL
+    user32.EmptyClipboard.restype = BOOL
+    user32.SetClipboardData.argtypes = [UINT, HANDLE]
+    user32.CloseClipboard.restype = BOOL
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+
+    kernel32.OpenProcess.argtypes = [DWORD, BOOL, DWORD]
+    kernel32.OpenProcess.restype = HANDLE
+    kernel32.CloseHandle.argtypes = [HANDLE]
+    kernel32.CloseHandle.restype = BOOL
+    kernel32.GlobalAlloc.argtypes = [UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = HANDLE
+    kernel32.GlobalLock.argtypes = [HANDLE]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [HANDLE]
+    kernel32.GlobalUnlock.restype = BOOL
+
     HAS_WIN32 = True
 except Exception:
     HAS_WIN32 = False
@@ -45,7 +94,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.1"
+VERSION = "2.2"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -129,19 +178,24 @@ def enum_windows():
     if not HAS_WIN32:
         return []
     results = []
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+    # CRITICAL: Use pointer-sized types for HWND and LPARAM on 64-bit Windows
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
     def callback(hwnd, _):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        class_name = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, class_name, 256)
-        if class_name.value == CHROME_CLASS:
-            title = ctypes.create_unicode_buffer(512)
-            user32.GetWindowTextW(hwnd, title, 512)
-            if title.value:
-                results.append((hwnd, title.value))
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            class_name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, class_name, 256)
+            if class_name.value == CHROME_CLASS:
+                title = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, title, 512)
+                if title.value:
+                    results.append((hwnd, title.value))
+        except Exception:
+            pass
         return True
-    user32.EnumWindows(WNDENUMPROC(callback), 0)
+    cb = WNDENUMPROC(callback)
+    user32.EnumWindows(cb, 0)
     return results
 
 
@@ -156,23 +210,24 @@ def get_process_exe(pid):
     """Get the executable path for a process."""
     if not HAS_WIN32:
         return ''
+    h = None
     try:
         h = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+        if not h:
+            # Try with just PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
+            h = kernel32.OpenProcess(0x1000, False, pid)
         if not h:
             return ''
         buf = ctypes.create_unicode_buffer(1024)
         size = ctypes.wintypes.DWORD(1024)
-        # QueryFullProcessImageNameW
-        try:
-            ret = kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
-            if ret:
-                return buf.value
-        except Exception:
-            pass
-        finally:
-            kernel32.CloseHandle(h)
+        ret = kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        if ret:
+            return buf.value
     except Exception:
         pass
+    finally:
+        if h:
+            kernel32.CloseHandle(h)
     return ''
 
 
@@ -762,11 +817,7 @@ class APMApp:
         tk.Button(size_frame, text='Fix', font=('', 7), width=7,
                   command=self._fix_all_sizes).pack(pady=1)
 
-        # TM Lite
-        self.tm_lite_btn = tk.Button(side, text='TM Lite', font=('', 7, 'bold'),
-                                      fg='white', bg='#4CA070',
-                                      command=self._tm_lite_all)
-        self.tm_lite_btn.pack(pady=(4, 0))
+        # (TM Lite removed per client request)
 
     # ── SETTINGS TAB ──────────────────────────────────────────────────────────
 
@@ -1053,10 +1104,23 @@ class APMApp:
     def _get_browsers(self):
         """Scan for SunBrowser windows - equivalent to GetBrowsers() in AutoIt."""
         if not HAS_WIN32:
+            self._log('No Win32 API available')
             return
 
-        chrome_windows = enum_windows()
+        try:
+            chrome_windows = enum_windows()
+        except Exception as e:
+            self._log(f'EnumWindows error: {e}')
+            return
+
         new_browsers = []
+
+        # Log scan results periodically
+        if not hasattr(self, '_scan_log_count'):
+            self._scan_log_count = 0
+        self._scan_log_count += 1
+        if self._scan_log_count <= 3 or self._scan_log_count % 20 == 0:
+            self._log(f'Scan: {len(chrome_windows)} Chrome windows found')
 
         # Batch refresh cmdline cache every 30s
         now = time.time()
@@ -1071,7 +1135,11 @@ class APMApp:
 
             # Check SunBrowser (cache result)
             if pid not in self.sunpid_cache:
-                self.sunpid_cache[pid] = is_sunbrowser(pid)
+                is_sun = is_sunbrowser(pid)
+                self.sunpid_cache[pid] = is_sun
+                if self._scan_log_count <= 5:
+                    exe = get_process_exe(pid)
+                    self._log(f'PID {pid}: exe={exe[-40:]}, sun={is_sun}')
             if not self.sunpid_cache[pid]:
                 continue
 
@@ -1085,10 +1153,13 @@ class APMApp:
                 user_id = get_adspower_userid_from_cmdline(cmdline)
                 if user_id:
                     profile_name = self.api.resolve_profile_name(user_id)
+                    self._log(f'Profile resolved: uid={user_id} -> {profile_name}')
                 else:
                     # Fallback: session name from cmdline
-                    m = re.search(r'--session[_-]name=([^\s"]+)', cmdline)
-                    profile_name = m.group(1) if m else f'PID:{pid}'
+                    m = re.search(r'--session[_-]name="?([^"\s]+)"?', cmdline)
+                    profile_name = m.group(1) if m else user_id if user_id else f'PID:{pid}'
+                    if self._scan_log_count <= 5:
+                        self._log(f'PID {pid}: no user_id from cmdline, using {profile_name}')
                 self.pid_profile_cache[pid] = profile_name
 
             # Tab title
