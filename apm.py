@@ -1,5 +1,5 @@
 """
-APM - AdsPower Window Manager v2.0
+APM - AdsPower Window Manager v2.1
 Rebuilt from AutoIt v5.5 source to Python.
 Manages AdsPower (SunBrowser) browser windows.
 """
@@ -11,6 +11,7 @@ import json
 import time
 import os
 import sys
+import math
 import configparser
 import re
 import struct
@@ -44,16 +45,18 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.0"
+VERSION = "2.1"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
 # Win32 constants
+SW_SHOWNORMAL = 1
 SW_MINIMIZE = 6
 SW_RESTORE = 9
 SW_MAXIMIZE = 3
 SW_SHOW = 5
 SWP_SHOWWINDOW = 0x0040
+SWP_NOACTIVATE = 0x0010
 HWND_TOP = 0
 GW_OWNER = 4
 WM_CLOSE = 0x0010
@@ -174,7 +177,8 @@ def get_process_exe(pid):
 
 
 def get_process_cmdline(pid):
-    """Get the command line of a process via WMI."""
+    """Get the command line of a process via WMI (wmic or PowerShell fallback)."""
+    # Try wmic first
     try:
         result = subprocess.run(
             ['wmic', 'process', 'where', f'ProcessId={pid}', 'get', 'CommandLine', '/format:list'],
@@ -183,6 +187,18 @@ def get_process_cmdline(pid):
         for line in result.stdout.splitlines():
             if line.startswith('CommandLine='):
                 return line[12:]
+    except Exception:
+        pass
+    # PowerShell fallback (wmic deprecated on newer Windows)
+    try:
+        ps_cmd = f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine'
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', ps_cmd],
+            capture_output=True, text=True, timeout=5, creationflags=0x08000000
+        )
+        cmdline = result.stdout.strip()
+        if cmdline:
+            return cmdline
     except Exception:
         pass
     return ''
@@ -195,29 +211,30 @@ def is_sunbrowser(pid):
 
 
 def get_adspower_userid_from_cmdline(cmdline):
-    """Extract user_id from --user-data-dir path in command line."""
-    # Pattern: --user-data-dir=.../<user_id>/
-    m = re.search(r'--user-data-dir=["\']?([^"\']+)', cmdline)
-    if m:
-        path = m.group(1).replace('\\', '/')
-        parts = [p for p in path.split('/') if p]
-        # The user_id is typically the folder name under cache/
-        for i, p in enumerate(parts):
-            if p in ('cache', 'Cache') and i + 1 < len(parts):
-                return parts[i + 1]
-        # Fallback: last non-empty segment
-        if parts:
-            return parts[-1]
-    # Also try --session_name
-    m = re.search(r'--session[_-]name=([^\s"]+)', cmdline)
+    """Extract user_id from --user-data-dir path in command line.
+    Matches AutoIt regex: user-data-dir="?[^"]*[/\\]([a-z0-9]+)[/\\]?"?
+    The user_id is the last path segment (e.g. k1blafdl_h26ptei)."""
+    # AutoIt pattern: last folder segment of user-data-dir path
+    m = re.search(r'user-data-dir="?[^"]*[/\\]([a-z0-9_]+)[/\\]?"?', cmdline, re.IGNORECASE)
     if m:
         return m.group(1)
+    # Also try --session_name
+    m = re.search(r'--session[_-]name="?([^"\s]+)"?', cmdline)
+    if m:
+        return m.group(1).strip()
     return ''
 
 
 def show_window(hwnd):
+    """Show and maximize a window (used for profile select/navigate)."""
     if HAS_WIN32:
         user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        user32.SetForegroundWindow(hwnd)
+
+
+def activate_window(hwnd):
+    """Activate/bring to front without maximizing (used for URL sending, groups)."""
+    if HAS_WIN32:
         user32.SetForegroundWindow(hwnd)
 
 
@@ -253,12 +270,11 @@ def is_window_visible(hwnd):
 
 
 def send_keys_to_window(hwnd, keys):
-    """Activate window and send keystrokes using subprocess call to PowerShell."""
+    """Activate window and send keystrokes (without maximizing)."""
     if not HAS_WIN32:
         return
-    show_window(hwnd)
+    activate_window(hwnd)
     time.sleep(0.15)
-    # Use ctypes to send keystrokes
     try:
         import keyboard as kb
         for key in keys:
@@ -356,35 +372,54 @@ class AdsPowerAPI:
         return None
 
     def _get(self, path, timeout=4):
-        if not requests:
-            return None
         for base in self.bases:
-            try:
-                r = requests.get(base + path, timeout=timeout)
-                if r.ok:
-                    return r.json()
-            except Exception:
-                continue
+            # Try requests first
+            if requests:
+                try:
+                    r = requests.get(base + path, timeout=timeout)
+                    if r.ok:
+                        return r.json()
+                except Exception:
+                    pass
+            # Fallback to urllib
+            else:
+                try:
+                    req = Request(base + path)
+                    resp = urlopen(req, timeout=timeout)
+                    return json.loads(resp.read().decode('utf-8'))
+                except Exception:
+                    pass
         return None
 
     def resolve_profile_name(self, user_id):
-        """Get the display name for a profile (serial_number > name > user_id)."""
+        """Get the display name for a profile.
+        Priority: serial_number > name > remark > user_id
+        Matches AutoIt _SEARCHCACHEFORSERIAL logic."""
+        def _extract_name(u):
+            if not u:
+                return ''
+            # Try fields in priority order (matching AutoIt)
+            for field in ['serial_number', 'serialnumber']:
+                val = str(u.get(field, '') or '').strip()
+                if val and val != '0' and val.lower() != 'null':
+                    return val
+            for field in ['name', 'remark']:
+                val = str(u.get(field, '') or '').strip()
+                if val and val != '0' and val.lower() != 'null':
+                    return val
+            return ''
+
         # First check cache
         users = self.get_user_list()
         for u in (users or []):
             uid = str(u.get('user_id') or u.get('userId') or u.get('id') or '')
             if uid == user_id:
-                serial = str(u.get('serial_number') or u.get('serialnumber') or '').strip()
-                name = str(u.get('name') or '').strip()
-                custom = str(u.get('custom_user_id') or '').strip()
-                return serial or custom or name or user_id
+                name = _extract_name(u)
+                return name if name else user_id
         # Direct fetch
         u = self.get_user_by_id(user_id)
-        if u:
-            serial = str(u.get('serial_number') or u.get('serialnumber') or '').strip()
-            name = str(u.get('name') or '').strip()
-            return serial or name or user_id
-        return user_id
+        name = _extract_name(u)
+        return name if name else user_id
 
 
 # ─── Distribte Extension ─────────────────────────────────────────────────────
@@ -478,44 +513,57 @@ def log_to_google_sheets(sheet_url, sheet_name, rows):
 # ─── Profile Image Generator ─────────────────────────────────────────────────
 
 def generate_profile_image(browsers):
-    """Generate a PNG table image of profiles (like the AutoIt GDI+ version)."""
+    """Generate a PNG table image of profiles matching AutoIt GDI+ specs.
+    512px wide, Consolas 9pt, alternating rows, header with count."""
     if not HAS_PIL:
         return None
 
     col_profile_w = 220
     col_tab_w = 280
-    total_w = col_profile_w + col_tab_w
+    padding = 12
+    total_w = col_profile_w + col_tab_w + padding
     row_h = 20
     header_h = 24
-    total_h = header_h + len(browsers) * row_h + 4
+    total_h = header_h + len(browsers) * row_h + padding
 
     img = Image.new('RGB', (total_w, max(total_h, 44)), 'white')
     draw = ImageDraw.Draw(img)
 
     try:
-        font = ImageFont.truetype('consola.ttf', 11)
-        font_bold = ImageFont.truetype('consolab.ttf', 11)
+        font = ImageFont.truetype('consola.ttf', 12)
+        font_bold = ImageFont.truetype('consolab.ttf', 12)
     except Exception:
         try:
-            font = ImageFont.truetype('cour.ttf', 11)
-            font_bold = font
+            font = ImageFont.truetype('C:/Windows/Fonts/consola.ttf', 12)
+            font_bold = ImageFont.truetype('C:/Windows/Fonts/consolab.ttf', 12)
         except Exception:
-            font = ImageFont.load_default()
-            font_bold = font
+            try:
+                font = ImageFont.truetype('cour.ttf', 12)
+                font_bold = font
+            except Exception:
+                font = ImageFont.load_default()
+                font_bold = font
 
-    # Header
-    draw.rectangle([0, 0, total_w, header_h], fill='#4a4a4a')
-    draw.text((4, 4), 'Profile', fill='white', font=font_bold)
-    draw.text((col_profile_w + 4, 4), 'Tab', fill='white', font=font_bold)
-    draw.line([(col_profile_w, 0), (col_profile_w, total_h)], fill='#999', width=1)
+    # Header - light gray like original
+    draw.rectangle([0, 0, total_w, header_h], fill='#D6D6D6')
+    draw.text((6, 4), f'Profile ({len(browsers)})', fill='black', font=font_bold)
+    draw.text((col_profile_w + 6, 4), 'Tab', fill='black', font=font_bold)
 
-    # Rows
+    # Column separator
+    draw.line([(col_profile_w, 0), (col_profile_w, total_h)], fill='#999999', width=1)
+    # Header separator
+    draw.line([(0, header_h), (total_w, header_h)], fill='#999999', width=1)
+
+    # Rows with alternating colors
     for i, (hwnd, title, profile, tab) in enumerate(browsers):
         y = header_h + i * row_h
-        bg = '#ffffff' if i % 2 == 0 else '#f0f0f0'
+        bg = '#FFFFFF' if i % 2 == 0 else '#F0F0F0'
         draw.rectangle([0, y, total_w, y + row_h], fill=bg)
-        draw.text((4, y + 2), str(profile)[:30], fill='black', font=font)
-        draw.text((col_profile_w + 4, y + 2), str(tab)[:40], fill='#333', font=font)
+        draw.text((6, y + 2), str(profile)[:30], fill='black', font=font)
+        draw.text((col_profile_w + 6, y + 2), str(tab)[:38], fill='black', font=font)
+
+    # Border rectangle
+    draw.rectangle([0, 0, total_w - 1, total_h - 1], outline='#999999', width=1)
 
     buf = BytesIO()
     img.save(buf, format='PNG')
@@ -1161,19 +1209,8 @@ class APMApp:
                                 except Exception:
                                     pass
 
-                # Apply custom nav size
-                if self.opt_custom_nav.get():
-                    try:
-                        nw = int(self.main_w_entry.get())
-                        nh = int(self.main_h_entry.get())
-                        # Get current position
-                        rect = ctypes.wintypes.RECT()
-                        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                        set_window_pos(hwnd, rect.left, rect.top, nw, nh)
-                    except Exception:
-                        show_window(hwnd)
-                else:
-                    show_window(hwnd)
+                # Always maximize (matches original AutoIt behavior)
+                show_window(hwnd)
         finally:
             self.browser_move_in_progress = False
 
@@ -1207,10 +1244,13 @@ class APMApp:
                         if is_window_visible(hwnd):
                             user32.DestroyWindow(hwnd)
                     elif action == 'refresh':
-                        show_window(hwnd)
+                        # AutoIt uses SW_RESTORE for refresh, not maximize
+                        if HAS_WIN32:
+                            user32.ShowWindow(hwnd, SW_RESTORE)
+                            user32.SetForegroundWindow(hwnd)
                         time.sleep(0.3)
                         send_keys_to_window(hwnd, ['{F5}'])
-                        time.sleep(0.5)
+                        time.sleep(1.0)
                 except Exception:
                     pass
 
@@ -1219,25 +1259,19 @@ class APMApp:
     # ── Groups ────────────────────────────────────────────────────────────────
 
     def _switch_group(self, group_index):
-        """Switch to group (virtual partition based on Cols*Rows)."""
+        """Switch to group (virtual partition based on Cols*Rows).
+        Matches AutoIt SWITCHGROUP logic exactly."""
         if self.active_group == group_index:
             # Toggle off
             self.active_group = -1
             for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
-                btn.configure(bg='SystemButtonFace')
-            # Show all
-            threading.Thread(target=self._show_all_browsers, daemon=True).start()
+                btn.configure(bg='SystemButtonFace', fg='black')
             return
 
-        self.active_group = group_index
-        # Highlight button
-        for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
-            btn.configure(bg='#4CA070' if idx == group_index else 'SystemButtonFace')
-
-        # Calculate group window range
+        # Read positioner settings
         try:
-            cols = int(self.pos_entries.get('Cols', tk.Entry()).get() or '4')
-            rows = int(self.pos_entries.get('Rows', tk.Entry()).get() or '2')
+            cols = max(1, int(self.pos_entries.get('Cols', tk.Entry()).get() or '4'))
+            rows = max(1, int(self.pos_entries.get('Rows', tk.Entry()).get() or '2'))
             width = int(self.pos_entries.get('Width', tk.Entry()).get() or '480')
             height = int(self.pos_entries.get('Height', tk.Entry()).get() or '540')
             gap_x = int(self.pos_entries.get('GapX', tk.Entry()).get() or '0')
@@ -1246,20 +1280,47 @@ class APMApp:
             cols, rows, width, height, gap_x, gap_y = 4, 2, 480, 540, 0, 0
 
         group_size = cols * rows
+        hwnds = self._get_all_hwnds()
+        count = len(hwnds)
+        if count == 0:
+            return
+
+        total_groups = math.ceil(count / group_size)
+        if group_index >= total_groups:
+            return
+
         start = group_index * group_size
-        end = start + group_size
+        end = min(start + group_size, count)
+
+        self.active_group = group_index
+        # Highlight active button, reset others
+        for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
+            if idx == group_index:
+                btn.configure(bg='#4CA070', fg='white')
+            else:
+                btn.configure(bg='SystemButtonFace', fg='black')
 
         def do_switch():
-            hwnds = self._get_all_hwnds()
+            # Step 1: Minimize all windows NOT in this group
             for i, hwnd in enumerate(hwnds):
-                if start <= i < end:
-                    col = (i - start) % cols
-                    row = (i - start) // cols
-                    x = col * (width + gap_x)
-                    y = row * (height + gap_y)
-                    set_window_pos(hwnd, x, y, width, height)
-                else:
+                if i < start or i >= end:
                     minimize_window(hwnd)
+            time.sleep(0.1)
+
+            # Step 2: Position group windows in grid using SW_SHOWNORMAL
+            idx = 0
+            for i in range(start, end):
+                hwnd = hwnds[i]
+                col = idx % cols
+                row = idx // cols
+                x = col * (width + gap_x)
+                y = row * (height + gap_y)
+                # SW_SHOWNORMAL (1) - show without maximizing
+                if HAS_WIN32:
+                    user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+                    time.sleep(0.05)
+                    user32.SetWindowPos(hwnd, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW)
+                idx += 1
 
         threading.Thread(target=do_switch, daemon=True).start()
 
@@ -1310,18 +1371,22 @@ class APMApp:
     def _tm_lite_all(self):
         """Send Alt+L to all browser windows (TM Lite toggle)."""
         def do_it():
+            try:
+                import keyboard as kb
+            except ImportError:
+                return
             for hwnd in self._get_all_hwnds():
-                show_window(hwnd)
+                activate_window(hwnd)
                 time.sleep(0.2)
-                send_keys_to_window(hwnd, ['!l'])
+                kb.send('alt+l')
                 time.sleep(0.3)
-            self.root.after(0, lambda: user32.SetForegroundWindow(
-                int(self.root.winfo_id())) if HAS_WIN32 else None)
         threading.Thread(target=do_it, daemon=True).start()
 
     # ── URL Opening ───────────────────────────────────────────────────────────
 
     def _open_url_all(self):
+        """Open URL in all browsers using keyboard automation.
+        Matches AutoIt: ClipPut, Activate, Ctrl+T, Ctrl+L, Ctrl+V, Enter."""
         url = self.main_url.get().strip()
         if not url:
             return
@@ -1329,19 +1394,26 @@ class APMApp:
 
         def do_open():
             set_clipboard(url)
-            for hwnd in self._get_all_hwnds():
+            try:
+                import keyboard as kb
+            except ImportError:
+                return
+            hwnds = self._get_all_hwnds()
+            for i, hwnd in enumerate(hwnds):
                 if self.stop_url_loop:
                     break
-                show_window(hwnd)
+                self._log(f'Opening URL: {i+1}/{len(hwnds)}')
+                # Activate without maximizing (match AutoIt WinActivate)
+                activate_window(hwnd)
+                time.sleep(0.15)
+                kb.send('ctrl+t')       # New tab
                 time.sleep(0.3)
-                send_keys_to_window(hwnd, ['^t'])
+                kb.send('ctrl+l')       # Focus address bar
                 time.sleep(0.2)
-                send_keys_to_window(hwnd, ['^l'])
-                time.sleep(0.1)
-                send_keys_to_window(hwnd, ['^v'])
-                time.sleep(0.1)
-                send_keys_to_window(hwnd, ['{ENTER}'])
-                time.sleep(0.5)
+                kb.send('ctrl+v')       # Paste URL
+                time.sleep(0.15)
+                kb.send('enter')        # Navigate
+                time.sleep(0.2)
             self.root.after(0, lambda: self._log('URL open complete'))
 
         threading.Thread(target=do_open, daemon=True).start()
