@@ -494,29 +494,62 @@ def activate_window(hwnd):
         pass
 
 
-def position_profile_window(hwnd, apm_rect):
-    """Position a profile browser window to the right of the APM window."""
+def position_profile_window(hwnd, apm_rect, custom_size=None, minimize_others=False):
+    """Position a profile browser window. If custom_size=(w,h), resize to that.
+    Otherwise position to the right of the APM window."""
     if not HAS_WIN32 or not hwnd:
         return
     try:
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-        # Place browser window to the right of APM
-        apm_right = apm_rect[2] if apm_rect else 400
-        browser_x = apm_right
-        browser_y = 0
-        browser_w = screen_w - browser_x
-        browser_h = screen_h - 40  # Leave space for taskbar
-
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
 
-        win32gui.SetWindowPos(
-            hwnd, win32con.HWND_TOP,
-            browser_x, browser_y, browser_w, browser_h,
-            win32con.SWP_SHOWWINDOW
-        )
+        if custom_size and custom_size[0] > 0 and custom_size[1] > 0:
+            # Use custom Click/Nav size — keep window in its current position, just resize
+            rect = win32gui.GetWindowRect(hwnd)
+            win32gui.SetWindowPos(
+                hwnd, win32con.HWND_TOP,
+                rect[0], rect[1], custom_size[0], custom_size[1],
+                win32con.SWP_SHOWWINDOW
+            )
+        else:
+            # Default: position browser to the right of APM
+            screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+            screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+            apm_right = apm_rect[2] if apm_rect else 400
+            browser_x = apm_right
+            browser_y = 0
+            browser_w = screen_w - browser_x
+            browser_h = screen_h - 40
+
+            win32gui.SetWindowPos(
+                hwnd, win32con.HWND_TOP,
+                browser_x, browser_y, browser_w, browser_h,
+                win32con.SWP_SHOWWINDOW
+            )
+
         win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def minimize_all_profile_windows(exclude_hwnd=None):
+    """Minimize all visible browser-like windows except the specified one."""
+    if not HAS_WIN32:
+        return
+    try:
+        def enum_cb(hwnd, _):
+            if hwnd == exclude_hwnd:
+                return True
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd)
+            # Minimize windows that look like browser windows
+            if title and not title.startswith('APM'):
+                cls = win32gui.GetClassName(hwnd)
+                if cls in ('Chrome_WidgetWin_1', 'MozillaWindowClass', 'Chrome_WidgetWin_0'):
+                    win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            return True
+        win32gui.EnumWindows(enum_cb, None)
     except Exception:
         pass
 
@@ -772,10 +805,26 @@ class APMApp:
         if not hwnd:
             return
 
+        # Check custom nav size setting
+        custom_size = None
+        use_custom = self.cfg.get('MAIN', 'UseCustomNavSize', fallback='0') == '1'
+        if use_custom:
+            try:
+                nav_w = int(self.cfg.get('MAIN', 'NavW', fallback='480'))
+                nav_h = int(self.cfg.get('MAIN', 'NavH', fallback='540'))
+                if nav_w > 0 and nav_h > 0:
+                    custom_size = (nav_w, nav_h)
+            except (ValueError, TypeError):
+                pass
+
+        # Minimize others if enabled
+        minimize_others = self.cfg.get('MAIN', 'MinimizeOthers', fallback='0') == '1'
+        if minimize_others:
+            minimize_all_profile_windows(exclude_hwnd=hwnd)
+
         # Get APM window rect to position browser next to it
         try:
             apm_hwnd = self.root.winfo_id()
-            # Get the top-level window handle
             import ctypes
             apm_hwnd = ctypes.windll.user32.GetParent(apm_hwnd)
             if apm_hwnd:
@@ -785,7 +834,7 @@ class APMApp:
         except Exception:
             apm_rect = (0, 0, 400, 700)
 
-        position_profile_window(hwnd, apm_rect)
+        position_profile_window(hwnd, apm_rect, custom_size=custom_size)
 
     def _open_url_in_all(self):
         url = self.url_entry.get().strip()
@@ -974,6 +1023,54 @@ class APMApp:
         row = 0
         entries = {}
 
+        # ── Options checkboxes ──
+        tk.Label(frame, text='OPTIONS', font=('Consolas', 10, 'bold'),
+                 fg='#e94560', bg=BG, anchor='w').grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(10, 4))
+        row += 1
+
+        check_vars = {}
+        check_options = [
+            ('AutoColumnSorting', 'Auto column sorting'),
+            ('InjectControls', 'Inject controls inside each browser'),
+            ('MinimizeOthers', 'Minimize others on profile select'),
+        ]
+        for key, label in check_options:
+            var = tk.IntVar(value=1 if self.cfg.get('MAIN', key, fallback='0') == '1' else 0)
+            check_vars[key] = var
+            cb = tk.Checkbutton(frame, text=label, variable=var,
+                                 font=('Consolas', 9), fg=FG, bg=BG,
+                                 selectcolor=BG2, activebackground=BG,
+                                 activeforeground=FG, anchor='w')
+            cb.grid(row=row, column=0, columnspan=2, sticky='w', padx=(10, 0), pady=1)
+            row += 1
+
+        # Custom nav size
+        nav_var = tk.IntVar(value=1 if self.cfg.get('MAIN', 'UseCustomNavSize', fallback='0') == '1' else 0)
+        check_vars['UseCustomNavSize'] = nav_var
+        nav_cb = tk.Checkbutton(frame, text='Use custom Click/Nav size:',
+                                 variable=nav_var, font=('Consolas', 9),
+                                 fg=FG, bg=BG, selectcolor=BG2,
+                                 activebackground=BG, activeforeground=FG, anchor='w')
+        nav_cb.grid(row=row, column=0, columnspan=2, sticky='w', padx=(10, 0), pady=1)
+        row += 1
+
+        nav_size_frame = tk.Frame(frame, bg=BG)
+        nav_size_frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=(30, 0), pady=2)
+        tk.Label(nav_size_frame, text='W:', font=('Consolas', 9), fg=FG2, bg=BG).pack(side='left')
+        nav_w_entry = tk.Entry(nav_size_frame, font=('Consolas', 9), bg=BG2, fg=FG,
+                                insertbackground=FG, bd=1, width=6)
+        nav_w_entry.insert(0, self.cfg.get('MAIN', 'NavW', fallback='480'))
+        nav_w_entry.pack(side='left', padx=(2, 10))
+        tk.Label(nav_size_frame, text='H:', font=('Consolas', 9), fg=FG2, bg=BG).pack(side='left')
+        nav_h_entry = tk.Entry(nav_size_frame, font=('Consolas', 9), bg=BG2, fg=FG,
+                                insertbackground=FG, bd=1, width=6)
+        nav_h_entry.insert(0, self.cfg.get('MAIN', 'NavH', fallback='540'))
+        nav_h_entry.pack(side='left', padx=2)
+        entries[('MAIN', 'NavW')] = nav_w_entry
+        entries[('MAIN', 'NavH')] = nav_h_entry
+        row += 1
+
         sections = [
             ('DISCORD', [
                 ('QueWebhook', 'Queue Webhook URL'),
@@ -1016,6 +1113,9 @@ class APMApp:
                 if not self.cfg.has_section(section):
                     self.cfg.add_section(section)
                 self.cfg.set(section, key, entry.get())
+            # Save checkbox values
+            for key, var in check_vars.items():
+                self.cfg.set('MAIN', key, '1' if var.get() else '0')
             save_config(self.cfg)
             # Re-register hotkeys
             if keyboard:
