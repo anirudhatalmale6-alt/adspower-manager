@@ -1,11 +1,11 @@
 """
-APM - AdsPower Manager v2.0
-Full-featured desktop app for managing AdsPower browser profiles.
-Feature-matched to APM v6.7 with improved performance.
+APM - AdsPower Window Manager v2.0
+Rebuilt from AutoIt v5.5 source to Python.
+Manages AdsPower (SunBrowser) browser windows.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import threading
 import json
 import time
@@ -13,39 +13,52 @@ import os
 import sys
 import configparser
 import re
+import struct
+import ctypes
+import ctypes.wintypes
 from datetime import datetime
+from io import BytesIO
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+import subprocess
 
 try:
     import requests
 except ImportError:
     requests = None
 
+# Windows API
 try:
-    import websocket
-except ImportError:
-    websocket = None
-
-try:
-    import keyboard
-except ImportError:
-    keyboard = None
-
-# Windows-specific imports
-try:
-    import win32gui
-    import win32con
-    import win32api
-    import win32process
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    psapi = ctypes.windll.psapi
     HAS_WIN32 = True
-except ImportError:
+except Exception:
     HAS_WIN32 = False
 
 try:
-    from PIL import ImageGrab
+    from PIL import Image, ImageDraw, ImageFont, ImageGrab
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
 
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+VERSION = "2.0"
+WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
+CHROME_CLASS = "Chrome_WidgetWin_1"
+
+# Win32 constants
+SW_MINIMIZE = 6
+SW_RESTORE = 9
+SW_MAXIMIZE = 3
+SW_SHOW = 5
+SWP_SHOWWINDOW = 0x0040
+HWND_TOP = 0
+GW_OWNER = 4
+WM_CLOSE = 0x0010
+PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_VM_READ = 0x0010
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -55,40 +68,44 @@ def get_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 BASE_DIR = get_base_dir()
-CONFIG_PATH = os.path.join(BASE_DIR, 'APMData', 'config.ini')
-SCREENSHOT_DIR = os.path.join(BASE_DIR, 'Screenshots')
+DATA_DIR = os.path.join(BASE_DIR, 'APManagerData')
+CONFIG_PATH = os.path.join(DATA_DIR, 'config.ini')
 
 def ensure_dirs():
-    os.makedirs(os.path.join(BASE_DIR, 'APMData'), exist_ok=True)
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 def load_config():
     cfg = configparser.ConfigParser()
     if os.path.exists(CONFIG_PATH):
         cfg.read(CONFIG_PATH, encoding='utf-8')
-    # Ensure sections exist
-    for s in ['MAIN', 'HOTKEYS', 'HOTKEYS2', 'DISCORD', 'SHEETS', 'SCREENSHOTS']:
+    for s in ['MAIN', 'HOTKEYS', 'HOTKEYS2', 'DISCORD', 'DISTRIBTE', 'POSITIONER', 'ADSPOWER']:
         if not cfg.has_section(s):
             cfg.add_section(s)
-    # Defaults
     defaults = {
         'MAIN': {
-            'AlwaysOnTop': '1', 'GUIW': '380', 'GUIH': '700', 'GUIX': '20', 'GUIY': '60',
-            'PollInterval': '3', 'AdsPowerPort': '50325',
-            'AutoColumnSorting': '0', 'InjectControls': '1', 'MinimizeOthers': '0',
-            'UseCustomNavSize': '1', 'NavW': '480', 'NavH': '540',
-            'SortColumn': '1', 'MainURL': '0', 'RemoveShadows': '1',
+            'GUIW': '374', 'GUIH': '680', 'GUIX': '920', 'GUIY': '180',
+            'SortColumn': '0', 'AutoSorting': '0', 'InjectControls': '1',
+            'AlwaysOnTop': '0', 'AllHotkeysON': '1',
+            'HotkeysToggleExtra': 'CTRL+SHIFT+H',
+            'MainURL': 'https://www.ticketmaster.com',
+            'CustomNavSize': '0', 'NavWidth': '480', 'NavHeight': '540',
+            'MinimizeOthers': '1',
         },
         'HOTKEYS': {
-            'FORWARD': 'ctrl+shift+right', 'BACKWARD': 'ctrl+shift+left',
-            'TOP': 'ctrl+shift+up', 'SORTTAB': 'ctrl+shift+t',
-            'SORTPROFILE': 'ctrl+shift+p', 'GROUPNEXT': '[', 'GROUPBACK': ']',
+            'FORWARD': 'CTRL+SHIFT+RIGHT', 'BACKWARD': 'CTRL+SHIFT+LEFT',
+            'TOP': 'CTRL+SHIFT+UP', 'SORTTAB': 'CTRL+SHIFT+T',
+            'SORTPROFILE': 'CTRL+SHIFT+P', 'GROUPNEXT': 'NONE', 'GROUPBACK': 'NONE',
         },
         'DISCORD': {
-            'QueWebhook': '', 'ProdWebhook': '', 'ProfileName': '',
+            'QueWebhook': '', 'ProdWebhook': '', 'VfWebhook': '',
+            'ProfileName': '', 'ScreenshotFolder': os.path.join(BASE_DIR, 'Screenshots'),
+            'SheetUrl': '',
         },
-        'SHEETS': {'SheetUrl': ''},
-        'SCREENSHOTS': {'Folder': SCREENSHOT_DIR},
+        'DISTRIBTE': {'Email': '', 'Password': ''},
+        'POSITIONER': {
+            'Cols': '4', 'Rows': '2', 'Width': '480', 'Height': '540',
+            'GapX': '0', 'GapY': '0', 'URL': 'https://www.ticketmaster.com',
+        },
     }
     for section, vals in defaults.items():
         for k, v in vals.items():
@@ -102,686 +119,614 @@ def save_config(cfg):
         cfg.write(f)
 
 
+# ─── Win32 Browser Management ────────────────────────────────────────────────
+
+def enum_windows():
+    """Get all visible windows with Chrome_WidgetWin_1 class."""
+    if not HAS_WIN32:
+        return []
+    results = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+    def callback(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, 256)
+        if class_name.value == CHROME_CLASS:
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, title, 512)
+            if title.value:
+                results.append((hwnd, title.value))
+        return True
+    user32.EnumWindows(WNDENUMPROC(callback), 0)
+    return results
+
+
+def get_window_pid(hwnd):
+    """Get the process ID of a window."""
+    pid = ctypes.wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+def get_process_exe(pid):
+    """Get the executable path for a process."""
+    if not HAS_WIN32:
+        return ''
+    try:
+        h = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+        if not h:
+            return ''
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.wintypes.DWORD(1024)
+        # QueryFullProcessImageNameW
+        try:
+            ret = kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+            if ret:
+                return buf.value
+        except Exception:
+            pass
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return ''
+
+
+def get_process_cmdline(pid):
+    """Get the command line of a process via WMI."""
+    try:
+        result = subprocess.run(
+            ['wmic', 'process', 'where', f'ProcessId={pid}', 'get', 'CommandLine', '/format:list'],
+            capture_output=True, text=True, timeout=5, creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith('CommandLine='):
+                return line[12:]
+    except Exception:
+        pass
+    return ''
+
+
+def is_sunbrowser(pid):
+    """Check if a PID is a SunBrowser (AdsPower browser) process."""
+    exe = get_process_exe(pid)
+    return 'SunBrowser' in exe or 'sun_browser' in exe.lower()
+
+
+def get_adspower_userid_from_cmdline(cmdline):
+    """Extract user_id from --user-data-dir path in command line."""
+    # Pattern: --user-data-dir=.../<user_id>/
+    m = re.search(r'--user-data-dir=["\']?([^"\']+)', cmdline)
+    if m:
+        path = m.group(1).replace('\\', '/')
+        parts = [p for p in path.split('/') if p]
+        # The user_id is typically the folder name under cache/
+        for i, p in enumerate(parts):
+            if p in ('cache', 'Cache') and i + 1 < len(parts):
+                return parts[i + 1]
+        # Fallback: last non-empty segment
+        if parts:
+            return parts[-1]
+    # Also try --session_name
+    m = re.search(r'--session[_-]name=([^\s"]+)', cmdline)
+    if m:
+        return m.group(1)
+    return ''
+
+
+def show_window(hwnd):
+    if HAS_WIN32:
+        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        user32.SetForegroundWindow(hwnd)
+
+
+def minimize_window(hwnd):
+    if HAS_WIN32:
+        user32.ShowWindow(hwnd, SW_MINIMIZE)
+
+
+def close_window(hwnd):
+    if HAS_WIN32:
+        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+
+def set_window_pos(hwnd, x, y, w, h):
+    if HAS_WIN32:
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW)
+        user32.SetForegroundWindow(hwnd)
+
+
+def get_window_title(hwnd):
+    if not HAS_WIN32:
+        return ''
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
+
+
+def is_window_visible(hwnd):
+    if not HAS_WIN32:
+        return False
+    return bool(user32.IsWindowVisible(hwnd))
+
+
+def send_keys_to_window(hwnd, keys):
+    """Activate window and send keystrokes using subprocess call to PowerShell."""
+    if not HAS_WIN32:
+        return
+    show_window(hwnd)
+    time.sleep(0.15)
+    # Use ctypes to send keystrokes
+    try:
+        import keyboard as kb
+        for key in keys:
+            if key == '{F5}':
+                kb.send('f5')
+            elif key == '!l':
+                kb.send('alt+l')
+            elif key == '^t':
+                kb.send('ctrl+t')
+            elif key == '^l':
+                kb.send('ctrl+l')
+            elif key == '^v':
+                kb.send('ctrl+v')
+            elif key == '{ENTER}':
+                kb.send('enter')
+            else:
+                kb.send(key)
+            time.sleep(0.05)
+    except ImportError:
+        pass
+
+
+def set_clipboard(text):
+    """Set clipboard text using ctypes."""
+    if not HAS_WIN32:
+        return
+    user32.OpenClipboard(0)
+    user32.EmptyClipboard()
+    # CF_UNICODETEXT = 13
+    data = text.encode('utf-16-le') + b'\x00\x00'
+    h = kernel32.GlobalAlloc(0x0042, len(data))
+    p = kernel32.GlobalLock(h)
+    ctypes.memmove(p, data, len(data))
+    kernel32.GlobalUnlock(h)
+    user32.SetClipboardData(13, h)
+    user32.CloseClipboard()
+
+
+def get_screen_size():
+    if HAS_WIN32:
+        return (user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+    return (1920, 1080)
+
+
 # ─── AdsPower API ─────────────────────────────────────────────────────────────
 
 class AdsPowerAPI:
     def __init__(self, port=50325):
-        self.port = port
-        self.bases = [
-            f'http://127.0.0.1:{port}',
-            f'http://local.adspower.net:{port}'
-        ]
-        self._base = None  # Cache working base
+        self.bases = [f'http://127.0.0.1:{port}', f'http://local.adspower.net:{port}']
+        self._cache = None
+        self._cache_time = 0
+        self._cache_ttl = 30  # seconds
+
+    def get_user_list(self, force=False):
+        """Get all profiles from AdsPower user/list API."""
+        now = time.time()
+        if not force and self._cache and (now - self._cache_time) < self._cache_ttl:
+            return self._cache
+
+        all_users = []
+        page = 1
+        while True:
+            data = self._get(f'/api/v1/user/list?page={page}&page_size=100')
+            if not data:
+                break
+            raw = data.get('data', {})
+            if isinstance(raw, dict):
+                users = raw.get('list', [])
+            elif isinstance(raw, list):
+                users = raw
+            else:
+                break
+            if not users:
+                break
+            all_users.extend(users)
+            page += 1
+            if len(users) < 100:
+                break
+
+        self._cache = all_users
+        self._cache_time = now
+        return all_users
+
+    def get_user_by_id(self, user_id):
+        """Get a single profile by user_id."""
+        data = self._get(f'/api/v1/user/list?user_id={user_id}')
+        if not data:
+            return None
+        raw = data.get('data', {})
+        if isinstance(raw, dict):
+            lst = raw.get('list', [])
+            return lst[0] if lst else None
+        elif isinstance(raw, list) and raw:
+            return raw[0]
+        return None
 
     def _get(self, path, timeout=4):
-        # Try cached base first
-        if self._base:
-            try:
-                r = requests.get(self._base + path, timeout=timeout)
-                if r.ok:
-                    return r.json()
-            except Exception:
-                self._base = None
+        if not requests:
+            return None
         for base in self.bases:
             try:
                 r = requests.get(base + path, timeout=timeout)
                 if r.ok:
-                    self._base = base
                     return r.json()
             except Exception:
                 continue
         return None
 
-    def get_active_profiles(self):
-        data = self._get('/api/v1/browser/active?page=1&page_size=100')
-        if not data:
-            return []
-        raw = data.get('data', [])
-        if isinstance(raw, dict):
-            raw = raw.get('list', [])
-        if not isinstance(raw, list):
-            return []
-
-        has_serial = any(p.get('serial_number') or p.get('serialnumber') for p in raw)
-        if has_serial:
-            return self._normalize(raw)
-
-        # Cross-reference with user/list
-        active_ids = {str(p.get('user_id', '')).strip() for p in raw if p.get('user_id')}
-        user_data = self._get('/api/v1/user/list?page=1&page_size=100')
-        if not user_data:
-            return self._normalize(raw)
-
-        all_users = user_data.get('data', {})
-        if isinstance(all_users, dict):
-            all_users = all_users.get('list', [])
-        if not isinstance(all_users, list):
-            return self._normalize(raw)
-
-        merged = []
-        for u in all_users:
-            uid = str(u.get('user_id', '')).strip()
-            if active_ids and uid not in active_ids:
-                continue
-            for a in raw:
-                if str(a.get('user_id', '')).strip() == uid:
-                    if not u.get('debug_port') and a.get('debug_port'):
-                        u['debug_port'] = a['debug_port']
-                    if not u.get('ws') and a.get('ws'):
-                        u['ws'] = a['ws']
-                    break
-            merged.append(u)
-
-        return self._normalize(merged if merged else raw)
-
-    def get_all_profiles(self):
-        """Get ALL profiles (not just active) for group assignment."""
-        data = self._get('/api/v1/user/list?page=1&page_size=100')
-        if not data:
-            return []
-        raw = data.get('data', {})
-        if isinstance(raw, dict):
-            raw = raw.get('list', [])
-        return self._normalize(raw) if isinstance(raw, list) else []
-
-    def get_groups(self):
-        """Get profile groups from AdsPower."""
-        data = self._get('/api/v1/group/list?page=1&page_size=100')
-        if not data:
-            return []
-        raw = data.get('data', {})
-        if isinstance(raw, dict):
-            raw = raw.get('list', [])
-        return raw if isinstance(raw, list) else []
-
-    def _normalize(self, raw):
-        profiles = []
-        for p in raw:
-            serial = str(p.get('serial_number') or p.get('serialnumber') or '').strip()
-            custom = str(p.get('custom_user_id') or p.get('customUserId') or '').strip()
-            uid = str(p.get('user_id') or p.get('userId') or p.get('id') or '').strip()
-            name = str(p.get('name') or p.get('profile_name') or (f'#{serial}' if serial else uid) or '')
-            group_id = str(p.get('group_id') or p.get('groupId') or '').strip()
-            group_name = str(p.get('group_name') or '').strip()
-            debug_port = self._get_debug_port(p)
-            profiles.append({
-                'serial': serial, 'custom': custom, 'uid': uid,
-                'name': name, 'debug_port': debug_port,
-                'group_id': group_id, 'group_name': group_name,
-            })
-        return profiles
-
-    def _get_debug_port(self, p):
-        if p.get('debug_port'):
-            try:
-                return int(p['debug_port'])
-            except (ValueError, TypeError):
-                pass
-        ws = p.get('ws', {})
-        ws_url = ws.get('puppeteer') or ws.get('selenium') or '' if isinstance(ws, dict) else ''
-        if ws_url:
-            try:
-                from urllib.parse import urlparse
-                return int(urlparse(ws_url).port or 0)
-            except Exception:
-                m = re.search(r':(\d+)/', ws_url)
-                if m:
-                    return int(m.group(1))
-        return 0
+    def resolve_profile_name(self, user_id):
+        """Get the display name for a profile (serial_number > name > user_id)."""
+        # First check cache
+        users = self.get_user_list()
+        for u in (users or []):
+            uid = str(u.get('user_id') or u.get('userId') or u.get('id') or '')
+            if uid == user_id:
+                serial = str(u.get('serial_number') or u.get('serialnumber') or '').strip()
+                name = str(u.get('name') or '').strip()
+                custom = str(u.get('custom_user_id') or '').strip()
+                return serial or custom or name or user_id
+        # Direct fetch
+        u = self.get_user_by_id(user_id)
+        if u:
+            serial = str(u.get('serial_number') or u.get('serialnumber') or '').strip()
+            name = str(u.get('name') or '').strip()
+            return serial or name or user_id
+        return user_id
 
 
-# ─── CDP Queue Scanner ────────────────────────────────────────────────────────
+# ─── Distribte Extension ─────────────────────────────────────────────────────
 
-TM_HOST_RE = re.compile(
-    r'ticketmaster\.com|livenation\.com|queue-it\.net|ticketmaster\.ca|ticketmaster\.co\.uk', re.I)
+DISTRIBTE_SEARCH_PATHS = [
+    r'C:\.ADSPOWER_GLOBAL', r'D:\.ADSPOWER_GLOBAL', r'E:\.ADSPOWER_GLOBAL',
+    r'C:\ADSPOWER_GLOBAL', r'D:\ADSPOWER_GLOBAL', r'E:\ADSPOWER_GLOBAL',
+]
 
-QUEUE_EVAL_JS = """(function(){
-function p(s){var n=parseInt(String(s).replace(/,/g,""),10);return(n>0&&n<100000000)?n:null;}
-var sel=["#MainPart_lbQueueNumber","#lbQueueNumber","[id*='lbQueueNumber']",
-"#MainPart_h2HeaderSubText","#h2-main",".queue-position","[class*='queuePosition']",
-"[class*='queueNumber']","[class*='waiting-number']","[class*='place-in-line']",
-"[data-queue-number]","#queue-number",".number-display"];
-for(var i=0;i<sel.length;i++){try{var el=document.querySelector(sel[i]);if(!el)continue;
-var m=el.textContent.replace(/,/g,"").match(/\\d+/);if(m){var v=p(m[0]);if(v)return{q:v,u:location.href,t:document.title};}}catch(e){}}
-var txt=document.body?document.body.innerText:"";
-var pts=[/you\\s+are\\s+(?:now\\s+)?in\\s+the\\s+queue\\s*#?\\s*([\\d,]+)/i,
-/([\\d,]+)\\s+people\\s+ahead/i,
-/you\\s+are\\s+(?:now\\s+)?(?:number\\s+|#\\s*)?([\\d,]+)\\s+in/i,
-/(?:queue\\s+)?position\\s+(?:is\\s+)?(?:number\\s+|#\\s*)?([\\d,]+)/i,
-/there\\s+are\\s+([\\d,]+)\\s+people/i];
-for(var j=0;j<pts.length;j++){var mm=txt.match(pts[j]);if(mm){var v=p(mm[1]);if(v)return{q:v,u:location.href,t:document.title};}}
-return null;})()"""
+def find_distribte_configs():
+    """Find all autologin-config.js files in AdsPower extension dirs."""
+    configs = []
+    search_dirs = list(DISTRIBTE_SEARCH_PATHS)
+    # Add user dirs
+    local = os.environ.get('LOCALAPPDATA', '')
+    appdata = os.environ.get('APPDATA', '')
+    home = os.environ.get('USERPROFILE', '')
+    if local:
+        search_dirs.append(os.path.join(local, 'AdsPower Global'))
+    if appdata:
+        search_dirs.append(os.path.join(appdata, 'AdsPower Global'))
+    if home:
+        search_dirs.append(os.path.join(home, '.adspower_global'))
 
-
-def _ws_eval(ws_url, expression, timeout=4):
-    try:
-        ws = websocket.create_connection(ws_url, timeout=timeout)
-    except Exception:
-        return None
-    try:
-        msg_id = 90000 + int(time.time() * 1000) % 10000
-        ws.send(json.dumps({
-            'id': msg_id, 'method': 'Runtime.evaluate',
-            'params': {'expression': expression, 'returnByValue': True}
-        }))
-        ws.settimeout(timeout)
-        while True:
-            raw = ws.recv()
-            if not raw:
-                break
-            msg = json.loads(raw)
-            if msg.get('id') == msg_id:
-                return (msg.get('result', {}).get('result', {}) or {}).get('value')
-    except Exception:
-        pass
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
-    return None
-
-
-def get_profile_tabs(debug_port):
-    """Get all open tabs for a profile."""
-    if not debug_port or debug_port <= 0:
-        return []
-    try:
-        r = requests.get(f'http://127.0.0.1:{debug_port}/json', timeout=2)
-        if not r.ok:
-            return []
-        tabs = r.json()
-        if not isinstance(tabs, list):
-            return []
-        return [t for t in tabs if t.get('url') and
-                not re.match(r'^(devtools:|chrome:|chrome-extension:)', t.get('url', ''), re.I)]
-    except Exception:
-        return []
-
-
-def cdp_eval_queue(debug_port, timeout=3):
-    """Scan profile tabs for queue numbers."""
-    tabs = get_profile_tabs(debug_port)
-    if not tabs:
-        return None
-
-    # Prefer TM/queue tabs
-    tm_tabs = [t for t in tabs if TM_HOST_RE.search(t.get('url', '')) and t.get('webSocketDebuggerUrl')]
-    scan_tabs = tm_tabs if tm_tabs else [t for t in tabs if t.get('webSocketDebuggerUrl')][:2]
-
-    for tab in scan_tabs:
-        ws_url = tab.get('webSocketDebuggerUrl', '')
-        if not ws_url:
+    for base_dir in search_dirs:
+        if not os.path.isdir(base_dir):
             continue
-        result = _ws_eval(ws_url, QUEUE_EVAL_JS, timeout=timeout)
-        if result and isinstance(result, dict) and result.get('q'):
-            return {
-                'queue_number': result['q'],
-                'url': result.get('u', tab.get('url', '')),
-                'title': result.get('t', tab.get('title', '')),
-            }
-        # Fallback: title parsing
-        title = tab.get('title', '')
-        m = re.match(r'^\s*#?([\d,]{1,8})\s*\|', title)
-        if m:
-            n = int(m.group(1).replace(',', ''))
-            if 0 < n < 100000000:
-                return {'queue_number': n, 'url': tab.get('url', ''), 'title': title}
-    return None
+        for root, dirs, files in os.walk(base_dir):
+            for f in files:
+                if f.lower() == 'autologin-config.js':
+                    configs.append(os.path.join(root, f))
+            # Limit depth
+            depth = root[len(base_dir):].count(os.sep)
+            if depth > 8:
+                dirs.clear()
+    return configs
 
 
-def cdp_open_tab(debug_port, url, timeout=5):
-    if not debug_port or debug_port <= 0:
+def write_distribte_config(filepath, email, password, enabled=True):
+    """Write autologin-config.js for the Distribte extension."""
+    content = f'const AUTOLOGIN_CONFIG = {{ email: "{email}", password: "{password}", enabled: {str(enabled).lower()} }};\n'
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
+
+
+# ─── Discord Integration ─────────────────────────────────────────────────────
+
+def discord_webhook_send_text(webhook_url, content, username='APM'):
+    if not webhook_url or not requests:
         return False
     try:
-        r = requests.get(f'http://127.0.0.1:{debug_port}/json/version', timeout=2)
-        if not r.ok:
-            return False
-        ws_url = r.json().get('webSocketDebuggerUrl', '')
-        if not ws_url:
-            return False
-        ws = websocket.create_connection(ws_url, timeout=timeout)
-        msg_id = 80000 + int(time.time() * 1000) % 10000
-        ws.send(json.dumps({'id': msg_id, 'method': 'Target.createTarget', 'params': {'url': url}}))
-        ws.settimeout(timeout)
-        while True:
-            raw = ws.recv()
-            if not raw:
-                break
-            msg = json.loads(raw)
-            if msg.get('id') == msg_id:
-                ws.close()
-                return bool(msg.get('result', {}).get('targetId'))
-        ws.close()
+        r = requests.post(webhook_url, json={'content': content, 'username': username}, timeout=10)
+        return r.ok
     except Exception:
-        pass
-    return False
+        return False
 
 
-def cdp_close_tabs(debug_port, timeout=3):
-    """Close all tabs in a profile browser."""
-    tabs = get_profile_tabs(debug_port)
-    if not tabs:
-        return
-    try:
-        r = requests.get(f'http://127.0.0.1:{debug_port}/json/version', timeout=2)
-        if not r.ok:
-            return
-        ws_url = r.json().get('webSocketDebuggerUrl', '')
-        if not ws_url:
-            return
-        ws = websocket.create_connection(ws_url, timeout=timeout)
-        for tab in tabs:
-            tid = tab.get('id', '')
-            if tid:
-                msg_id = 70000 + int(time.time() * 1000) % 10000
-                ws.send(json.dumps({'id': msg_id, 'method': 'Target.closeTarget',
-                                     'params': {'targetId': tid}}))
-                try:
-                    ws.recv()
-                except Exception:
-                    pass
-        ws.close()
-    except Exception:
-        pass
-
-
-# ─── Window Management ───────────────────────────────────────────────────────
-
-def find_profile_window(debug_port):
-    """Find the Windows HWND for a profile browser by its debug port."""
-    if not HAS_WIN32 or not debug_port:
+def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles.png',
+                                  content='', username='APM'):
+    """Upload an image to Discord via webhook multipart."""
+    if not webhook_url or not requests:
         return None
-    target_pids = set()
     try:
-        import subprocess
-        result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=3)
-        for line in result.stdout.splitlines():
-            if f':{debug_port}' in line and 'LISTENING' in line:
-                parts = line.split()
-                if parts:
-                    try:
-                        target_pids.add(int(parts[-1]))
-                    except ValueError:
-                        pass
+        files = {'file': (filename, image_bytes, 'image/png')}
+        data = {'content': content, 'username': username}
+        r = requests.post(webhook_url + '?wait=true', data=data, files=files, timeout=15)
+        if r.ok:
+            resp = r.json()
+            attachments = resp.get('attachments', [])
+            if attachments:
+                return attachments[0].get('url', '')
+        return None
     except Exception:
-        pass
-    if not target_pids:
         return None
 
-    best_hwnd = None
-    best_area = 0
 
-    def enum_cb(hwnd, _):
-        nonlocal best_hwnd, best_area
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
+def log_to_google_sheets(sheet_url, sheet_name, rows):
+    """POST data to Google Apps Script webhook."""
+    if not sheet_url or not requests:
+        return
+    try:
+        requests.post(sheet_url, json={'sheet': sheet_name, 'rows': rows}, timeout=10)
+    except Exception:
+        pass
+
+
+# ─── Profile Image Generator ─────────────────────────────────────────────────
+
+def generate_profile_image(browsers):
+    """Generate a PNG table image of profiles (like the AutoIt GDI+ version)."""
+    if not HAS_PIL:
+        return None
+
+    col_profile_w = 220
+    col_tab_w = 280
+    total_w = col_profile_w + col_tab_w
+    row_h = 20
+    header_h = 24
+    total_h = header_h + len(browsers) * row_h + 4
+
+    img = Image.new('RGB', (total_w, max(total_h, 44)), 'white')
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype('consola.ttf', 11)
+        font_bold = ImageFont.truetype('consolab.ttf', 11)
+    except Exception:
         try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            if pid not in target_pids:
-                return True
-            title = win32gui.GetWindowText(hwnd)
-            if not title:
-                return True
-            rect = win32gui.GetWindowRect(hwnd)
-            area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-            if area > best_area:
-                best_area = area
-                best_hwnd = hwnd
+            font = ImageFont.truetype('cour.ttf', 11)
+            font_bold = font
         except Exception:
-            pass
-        return True
+            font = ImageFont.load_default()
+            font_bold = font
 
-    try:
-        win32gui.EnumWindows(enum_cb, None)
-    except Exception:
-        pass
-    return best_hwnd
+    # Header
+    draw.rectangle([0, 0, total_w, header_h], fill='#4a4a4a')
+    draw.text((4, 4), 'Profile', fill='white', font=font_bold)
+    draw.text((col_profile_w + 4, 4), 'Tab', fill='white', font=font_bold)
+    draw.line([(col_profile_w, 0), (col_profile_w, total_h)], fill='#999', width=1)
 
+    # Rows
+    for i, (hwnd, title, profile, tab) in enumerate(browsers):
+        y = header_h + i * row_h
+        bg = '#ffffff' if i % 2 == 0 else '#f0f0f0'
+        draw.rectangle([0, y, total_w, y + row_h], fill=bg)
+        draw.text((4, y + 2), str(profile)[:30], fill='black', font=font)
+        draw.text((col_profile_w + 4, y + 2), str(tab)[:40], fill='#333', font=font)
 
-def get_all_browser_hwnds():
-    """Get all Chrome/browser window handles."""
-    if not HAS_WIN32:
-        return []
-    hwnds = []
-    def enum_cb(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        cls = win32gui.GetClassName(hwnd)
-        if cls in ('Chrome_WidgetWin_1', 'Chrome_WidgetWin_0'):
-            title = win32gui.GetWindowText(hwnd)
-            if title:
-                hwnds.append(hwnd)
-        return True
-    try:
-        win32gui.EnumWindows(enum_cb, None)
-    except Exception:
-        pass
-    return hwnds
+    buf = BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
 
 
-def show_window(hwnd):
-    if not HAS_WIN32 or not hwnd:
-        return
-    try:
-        if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
-
-
-def minimize_window(hwnd):
-    if not HAS_WIN32 or not hwnd:
-        return
-    try:
-        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-    except Exception:
-        pass
-
-
-def position_window(hwnd, x, y, w, h):
-    if not HAS_WIN32 or not hwnd:
-        return
-    try:
-        if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, x, y, w, h, win32con.SWP_SHOWWINDOW)
-        win32gui.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
-
-
-def activate_profile(debug_port, custom_size=None, minimize_others=False):
-    """Bring a profile window to front, optionally resize and minimize others."""
-    hwnd = find_profile_window(debug_port)
-    if not hwnd:
-        return
-
-    if minimize_others:
-        all_hwnds = get_all_browser_hwnds()
-        for h in all_hwnds:
-            if h != hwnd:
-                minimize_window(h)
-
-    if custom_size and custom_size[0] > 0 and custom_size[1] > 0:
-        try:
-            rect = win32gui.GetWindowRect(hwnd)
-            position_window(hwnd, rect[0], rect[1], custom_size[0], custom_size[1])
-        except Exception:
-            show_window(hwnd)
-    else:
-        show_window(hwnd)
-
-
-# ─── Discord ─────────────────────────────────────────────────────────────────
-
-def send_discord(webhook_url, content, username='APM'):
-    if not webhook_url:
-        return
-    try:
-        requests.post(webhook_url, json={'content': content, 'username': username}, timeout=5)
-    except Exception:
-        pass
-
-
-# ─── Main GUI ─────────────────────────────────────────────────────────────────
+# ─── Main Application ────────────────────────────────────────────────────────
 
 class APMApp:
-    # Colors
-    BG = '#2b2b2b'
-    BG2 = '#3c3c3c'
-    BG3 = '#4a4a4a'
-    FG = '#e0e0e0'
-    FG2 = '#999'
-    ACCENT = '#e94560'
-    GOLD = '#ffd700'
-    GREEN = '#00e676'
-    CYAN = '#00bcd4'
-    PURPLE = '#7b2ff7'
+    BG = '#f0f0f0'  # System-like light theme (matching AutoIt default)
 
     def __init__(self):
         ensure_dirs()
         self.cfg = load_config()
-        self.api = AdsPowerAPI(int(self.cfg.get('MAIN', 'AdsPowerPort')))
-        self.profiles = []          # Active profiles
-        self.profile_tabs = {}      # serial -> [tab titles]
-        self.queue_data = {}        # serial -> {queue_number, url, title}
-        self.selected_index = -1
-        self.selected_indices = set()
-        self.current_group = None   # None = all
+        self.api = AdsPowerAPI(50325)
+        self.browsers = []  # [(hwnd, title, profile_name, tab_title), ...]
+        self.current_pos = 0
         self.running = True
+        self.stop_url_loop = False
+        self.browser_move_in_progress = False
+        self.active_group = -1
+        self.sort_by = 0  # 0=profile, 1=tab
+        self.hotkeys_on = True
+        self.extra_hotkeys_on = False
+        self.pid_profile_cache = {}  # pid -> profile_name
+        self.sunpid_cache = {}  # pid -> bool
+        self.cmdline_cache = {}  # pid -> cmdline
+        self.cmdline_cache_time = 0
+        self.dist_queue = []  # [(hwnd, countdown), ...]
+        self.dist_running = False
         self.debug_log = []
-        self.hotkeys_enabled = True
 
         self._build_gui()
+        self._load_all_settings()
         self._register_hotkeys()
         self._start_polling()
 
     def _log(self, msg):
         ts = datetime.now().strftime('%H:%M:%S')
-        line = f'[{ts}] {msg}'
-        self.debug_log.append(line)
+        self.debug_log.append(f'[{ts}] {msg}')
         if len(self.debug_log) > 500:
             self.debug_log = self.debug_log[-300:]
 
-    # ── GUI ───────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # GUI CONSTRUCTION - matches AutoIt layout
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _build_gui(self):
         self.root = tk.Tk()
-        self.root.title('AdsPower Window Manager v2.0')
-        self.root.configure(bg=self.BG)
+        self.root.title(WINDOW_TITLE)
 
         w = int(self.cfg.get('MAIN', 'GUIW'))
         h = int(self.cfg.get('MAIN', 'GUIH'))
         x = int(self.cfg.get('MAIN', 'GUIX'))
         y = int(self.cfg.get('MAIN', 'GUIY'))
         self.root.geometry(f'{w}x{h}+{x}+{y}')
-        self.root.minsize(340, 500)
+        self.root.minsize(374, 500)
+        self.root.maxsize(374, 2000)
+        self.root.resizable(True, True)
 
-        self.always_on_top = self.cfg.get('MAIN', 'AlwaysOnTop') == '1'
-        self.root.attributes('-topmost', self.always_on_top)
+        always_on_top = self.cfg.get('MAIN', 'AlwaysOnTop') == '1'
+        self.root.attributes('-topmost', always_on_top)
 
-        # ── Top bar: tabs + toggles ──
-        topbar = tk.Frame(self.root, bg=self.BG2)
-        topbar.pack(fill='x')
+        # ── Tab Control ──
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True, padx=4, pady=(4, 0))
 
-        self.tab_buttons = {}
-        tab_names = ['Main', 'Settings', 'Discord', 'Distribute', 'Pos']
-        for name in tab_names:
-            btn = tk.Button(topbar, text=name, font=('Segoe UI', 8),
-                            fg=self.FG, bg=self.BG2, bd=0, padx=6, pady=3,
-                            activebackground=self.BG3, cursor='hand2',
-                            command=lambda n=name: self._switch_tab(n))
-            btn.pack(side='left')
-            self.tab_buttons[name] = btn
+        # Create tab frames
+        self.tab_main = ttk.Frame(self.notebook)
+        self.tab_settings = ttk.Frame(self.notebook)
+        self.tab_discord = ttk.Frame(self.notebook)
+        self.tab_distribte = ttk.Frame(self.notebook)
+        self.tab_pos = ttk.Frame(self.notebook)
 
-        # Hotkeys toggle
-        self.hotkeys_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(topbar, text='Hotkeys', variable=self.hotkeys_var,
-                        font=('Segoe UI', 8), fg=self.FG, bg=self.BG2,
-                        selectcolor=self.BG, activebackground=self.BG2,
-                        command=self._toggle_hotkeys).pack(side='left', padx=4)
+        self.notebook.add(self.tab_main, text='Main')
+        self.notebook.add(self.tab_settings, text='Settings')
+        self.notebook.add(self.tab_discord, text='Discord')
+        self.notebook.add(self.tab_distribte, text='Distribte')
+        self.notebook.add(self.tab_pos, text='Pos')
 
-        # On top toggle
-        self.ontop_var = tk.BooleanVar(value=self.always_on_top)
-        tk.Checkbutton(topbar, text='On top', variable=self.ontop_var,
-                        font=('Segoe UI', 8), fg=self.FG, bg=self.BG2,
-                        selectcolor=self.BG, activebackground=self.BG2,
-                        command=self._toggle_ontop).pack(side='left', padx=4)
+        # Top-right controls (Hotkeys checkbox + On top)
+        top_frame = tk.Frame(self.root)
+        top_frame.place(x=220, y=4)
 
-        # ── Tab content area ──
-        self.tab_container = tk.Frame(self.root, bg=self.BG)
-        self.tab_container.pack(fill='both', expand=True)
+        self.hotkeys_var = tk.BooleanVar(value=self.cfg.get('MAIN', 'AllHotkeysON') == '1')
+        tk.Checkbutton(top_frame, text='Hotkeys', variable=self.hotkeys_var,
+                        command=self._toggle_hotkeys).pack(side='left')
 
-        self.tab_frames = {}
-        for name in tab_names:
-            frame = tk.Frame(self.tab_container, bg=self.BG)
-            self.tab_frames[name] = frame
+        self.ontop_var = tk.BooleanVar(value=always_on_top)
+        tk.Checkbutton(top_frame, text='On top', variable=self.ontop_var,
+                        command=self._toggle_ontop).pack(side='left')
 
         self._build_main_tab()
         self._build_settings_tab()
         self._build_discord_tab()
-        self._build_distribute_tab()
+        self._build_distribte_tab()
         self._build_pos_tab()
-
-        # ── Bottom bar ──
         self._build_bottom_bar()
 
-        self._switch_tab('Main')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
-    def _switch_tab(self, name):
-        for n, f in self.tab_frames.items():
-            f.pack_forget()
-        self.tab_frames[name].pack(fill='both', expand=True)
-        for n, btn in self.tab_buttons.items():
-            btn.configure(bg=self.BG3 if n == name else self.BG2)
-
-    # ── Main Tab ──────────────────────────────────────────────────────────────
+    # ── MAIN TAB ──────────────────────────────────────────────────────────────
 
     def _build_main_tab(self):
-        f = self.tab_frames['Main']
+        f = self.tab_main
 
-        # Navigation row
-        nav = tk.Frame(f, bg=self.BG)
-        nav.pack(fill='x', padx=5, pady=4)
+        # Navigation: <<<, TOP, >>>
+        nav = tk.Frame(f)
+        nav.pack(fill='x', padx=4, pady=(4, 2))
 
-        tk.Button(nav, text='<<<', font=('Consolas', 9, 'bold'), fg='#fff', bg=self.BG3,
-                  bd=0, padx=8, pady=2, command=lambda: self._cycle(-1)).pack(side='left', padx=2)
-        tk.Button(nav, text='TOP', font=('Consolas', 9, 'bold'), fg='#fff', bg=self.BG3,
-                  bd=0, padx=12, pady=2, command=self._go_top).pack(side='left', padx=2)
-        tk.Button(nav, text='>>>', font=('Consolas', 9, 'bold'), fg='#fff', bg=self.BG3,
-                  bd=0, padx=8, pady=2, command=lambda: self._cycle(1)).pack(side='left', padx=2)
+        tk.Button(nav, text='<<<', width=8, command=self._move_back).pack(side='left', padx=2)
+        tk.Button(nav, text='TOP', width=8, command=self._move_top).pack(side='left', padx=2)
+        tk.Button(nav, text='>>>', width=8, command=self._move_fwd).pack(side='left', padx=2)
 
-        # Profile list + side buttons
-        mid = tk.Frame(f, bg=self.BG)
-        mid.pack(fill='both', expand=True, padx=5, pady=2)
+        # Main content: ListView + side buttons
+        content = tk.Frame(f)
+        content.pack(fill='both', expand=True, padx=4, pady=2)
 
-        # Treeview for profile list
-        list_frame = tk.Frame(mid, bg=self.BG)
-        list_frame.pack(side='left', fill='both', expand=True)
+        # Treeview (Profile | Tab | Handle)
+        tree_frame = tk.Frame(content)
+        tree_frame.pack(side='left', fill='both', expand=True)
 
-        cols = ('profile', 'tab')
-        self.tree = ttk.Treeview(list_frame, columns=cols, show='headings', height=15,
-                                  selectmode='extended')
-        self.tree.heading('profile', text='Profile', command=lambda: self._sort_column('profile'))
-        self.tree.heading('tab', text='Tab', command=lambda: self._sort_column('tab'))
-        self.tree.column('profile', width=100, minwidth=60)
-        self.tree.column('tab', width=180, minwidth=80)
+        cols = ('profile', 'tab', 'handle')
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings', selectmode='extended')
+        self.tree.heading('profile', text='Profile', command=lambda: self._sort_tree(0))
+        self.tree.heading('tab', text='Tab', command=lambda: self._sort_tree(1))
+        self.tree.heading('handle', text='Handle')
+        self.tree.column('profile', width=120, minwidth=60)
+        self.tree.column('tab', width=120, minwidth=60)
+        self.tree.column('handle', width=0, stretch=False)  # Hidden
 
-        # Style
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('Treeview', background=self.BG, foreground=self.FG,
-                         fieldbackground=self.BG, font=('Consolas', 9), rowheight=22)
-        style.configure('Treeview.Heading', background=self.BG2, foreground=self.FG,
-                         font=('Segoe UI', 8, 'bold'))
-        style.map('Treeview', background=[('selected', self.PURPLE)],
-                   foreground=[('selected', '#fff')])
-
-        scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.tree.yview)
+        scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        self.tree.bind('<<TreeviewSelect>>', self._on_tree_select)
-        self.tree.bind('<Double-1>', self._on_tree_double_click)
+        self.tree.bind('<<TreeviewSelect>>', self._on_select)
+        self.tree.bind('<Double-1>', lambda e: self._browser_action('show'))
 
         # Side buttons
-        side = tk.Frame(mid, bg=self.BG)
+        side = tk.Frame(content, width=65)
         side.pack(side='right', fill='y', padx=(4, 0))
+        side.pack_propagate(False)
 
-        side_buttons = [
-            ('Show', self._btn_show),
-            ('Minimize', self._btn_minimize),
-            ('RefreshAll', self._btn_refresh_all),
-            ('Close All', self._btn_close_all),
-            ('Close Sel', self._btn_close_selected),
-            ('Show All', self._btn_show_all),
-            ('MinimizeAll', self._btn_minimize_all),
+        buttons = [
+            ('Show', lambda: self._browser_action('show')),
+            ('Minimize', lambda: self._browser_action('minimize')),
+            ('RefreshAll', lambda: self._browser_action('refresh', all_=True)),
+            ('Close All', lambda: self._browser_action('close', all_=True)),
+            ('Close Sel', lambda: self._browser_action('close')),
+            ('Show All', lambda: self._browser_action('show', all_=True)),
+            ('MinimizeAll', lambda: self._browser_action('minimize', all_=True)),
         ]
-        for text, cmd in side_buttons:
-            tk.Button(side, text=text, font=('Segoe UI', 8), fg=self.FG, bg=self.BG2,
-                      bd=1, relief='raised', padx=4, pady=1, width=10,
-                      activebackground=self.BG3, cursor='hand2',
-                      command=cmd).pack(pady=1)
+        for text, cmd in buttons:
+            tk.Button(side, text=text, font=('', 7), width=9, command=cmd).pack(pady=1)
 
-        # ── Group section ──
-        grp_frame = tk.Frame(f, bg=self.BG)
-        grp_frame.pack(fill='x', padx=5, pady=4)
+        # Groups A-Z
+        grp_label = tk.Label(side, text='Grp:', font=('', 7, 'bold'))
+        grp_label.pack(pady=(6, 1))
 
-        tk.Label(grp_frame, text='Grp:', font=('Segoe UI', 8, 'bold'),
-                 fg=self.FG2, bg=self.BG).pack(side='left')
+        self.grp_btns = {}
+        for row_start in range(0, 26, 3):
+            row_frame = tk.Frame(side)
+            row_frame.pack()
+            for i in range(3):
+                idx = row_start + i
+                if idx >= 26:
+                    break
+                letter = chr(65 + idx)
+                btn = tk.Button(row_frame, text=letter, font=('', 6, 'bold'),
+                                width=2, height=1, padx=0, pady=0,
+                                command=lambda l=idx: self._switch_group(l))
+                btn.pack(side='left', padx=1)
+                self.grp_btns[idx] = btn
 
-        self.grp_buttons_frame = tk.Frame(grp_frame, bg=self.BG)
-        self.grp_buttons_frame.pack(side='left', fill='x', expand=True, padx=4)
+        # W/H resize
+        size_frame = tk.Frame(side)
+        size_frame.pack(pady=(4, 0))
 
-        # Grid of A-Z buttons
-        letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        self.grp_btn_map = {}
-        row_frame = None
-        for i, letter in enumerate(letters):
-            if i % 3 == 0:
-                row_frame = tk.Frame(self.grp_buttons_frame, bg=self.BG)
-                row_frame.pack(fill='x', pady=1)
-            btn = tk.Button(row_frame, text=letter, font=('Consolas', 8, 'bold'),
-                            fg=self.FG, bg=self.BG2, bd=1, width=2, pady=0,
-                            activebackground=self.PURPLE, cursor='hand2',
-                            command=lambda l=letter: self._select_group(l))
-            btn.pack(side='left', padx=1)
-            self.grp_btn_map[letter] = btn
+        wh = tk.Frame(size_frame)
+        wh.pack()
+        tk.Label(wh, text='W:', font=('', 7)).pack(side='left')
+        self.main_w_entry = tk.Entry(wh, width=5, font=('', 8))
+        self.main_w_entry.insert(0, self.cfg.get('MAIN', 'NavWidth'))
+        self.main_w_entry.pack(side='left')
 
-        # Nav size section
-        nav_size_frame = tk.Frame(f, bg=self.BG)
-        nav_size_frame.pack(fill='x', padx=5, pady=2)
+        wh2 = tk.Frame(size_frame)
+        wh2.pack()
+        tk.Label(wh2, text='H:', font=('', 7)).pack(side='left')
+        self.main_h_entry = tk.Entry(wh2, width=5, font=('', 8))
+        self.main_h_entry.insert(0, self.cfg.get('MAIN', 'NavHeight'))
+        self.main_h_entry.pack(side='left')
 
-        tk.Label(nav_size_frame, text='W:', font=('Consolas', 9),
-                 fg=self.FG2, bg=self.BG).pack(side='left')
-        self.nav_w_entry = tk.Entry(nav_size_frame, font=('Consolas', 9), bg=self.BG2,
-                                     fg=self.FG, bd=1, width=6, insertbackground=self.FG)
-        self.nav_w_entry.insert(0, self.cfg.get('MAIN', 'NavW'))
-        self.nav_w_entry.pack(side='left', padx=2)
+        tk.Button(size_frame, text='Apply', font=('', 7), width=7,
+                  command=self._apply_resize).pack(pady=1)
+        tk.Button(size_frame, text='Fix', font=('', 7), width=7,
+                  command=self._fix_all_sizes).pack(pady=1)
 
-        tk.Label(nav_size_frame, text='H:', font=('Consolas', 9),
-                 fg=self.FG2, bg=self.BG).pack(side='left', padx=(8, 0))
-        self.nav_h_entry = tk.Entry(nav_size_frame, font=('Consolas', 9), bg=self.BG2,
-                                     fg=self.FG, bd=1, width=6, insertbackground=self.FG)
-        self.nav_h_entry.insert(0, self.cfg.get('MAIN', 'NavH'))
-        self.nav_h_entry.pack(side='left', padx=2)
+        # TM Lite
+        self.tm_lite_btn = tk.Button(side, text='TM Lite', font=('', 7, 'bold'),
+                                      fg='white', bg='#4CA070',
+                                      command=self._tm_lite_all)
+        self.tm_lite_btn.pack(pady=(4, 0))
 
-        tk.Button(nav_size_frame, text='Apply', font=('Segoe UI', 8), fg=self.FG,
-                  bg=self.BG2, bd=1, padx=6, command=self._apply_nav_size).pack(side='left', padx=4)
-        tk.Button(nav_size_frame, text='Fix', font=('Segoe UI', 8), fg=self.FG,
-                  bg=self.BG2, bd=1, padx=6, command=self._fix_windows).pack(side='left', padx=2)
-
-        # Horizontal scrollbar placeholder
-        hscroll = tk.Frame(f, bg=self.BG, height=18)
-        hscroll.pack(fill='x', padx=5)
-        tk.Button(hscroll, text='<', font=('Consolas', 8), fg=self.FG, bg=self.BG2,
-                  bd=0, padx=6, command=lambda: self._cycle(-1)).pack(side='left')
-        self.scroll_scale = tk.Scale(hscroll, from_=0, to=100, orient='horizontal',
-                                      bg=self.BG2, fg=self.FG, troughcolor=self.BG,
-                                      highlightthickness=0, bd=0, showvalue=False,
-                                      command=self._on_scroll)
-        self.scroll_scale.pack(side='left', fill='x', expand=True)
-        tk.Button(hscroll, text='>', font=('Consolas', 8), fg=self.FG, bg=self.BG2,
-                  bd=0, padx=6, command=lambda: self._cycle(1)).pack(side='right')
-
-        # TM Lite button
-        self.tm_lite_active = False
-        self.tm_lite_btn = tk.Button(f, text='TM Lite', font=('Segoe UI', 9, 'bold'),
-                                      fg='#fff', bg=self.ACCENT, bd=0, padx=12, pady=3,
-                                      cursor='hand2', command=self._toggle_tm_lite)
-        self.tm_lite_btn.pack(side='right', padx=5, pady=2)
-
-    # ── Settings Tab ──────────────────────────────────────────────────────────
+    # ── SETTINGS TAB ──────────────────────────────────────────────────────────
 
     def _build_settings_tab(self):
-        f = self.tab_frames['Settings']
-        canvas = tk.Canvas(f, bg=self.BG, highlightthickness=0)
+        f = self.tab_settings
+        canvas = tk.Canvas(f)
         scrollbar = tk.Scrollbar(f, orient='vertical', command=canvas.yview)
-        inner = tk.Frame(canvas, bg=self.BG)
+        inner = tk.Frame(canvas)
         inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.create_window((0, 0), window=inner, anchor='nw')
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -789,739 +734,910 @@ class APMApp:
         scrollbar.pack(side='right', fill='y')
 
         row = 0
-        tk.Label(inner, text='OPTIONS', font=('Segoe UI', 9, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).grid(row=row, column=0, columnspan=2, sticky='w', pady=(8, 4), padx=8)
+        tk.Label(inner, text='Primary Hotkeys', font=('', 9, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(6, 2), padx=8)
         row += 1
 
-        self.settings_checks = {}
-        checks = [
-            ('AutoColumnSorting', 'Auto column sorting'),
-            ('InjectControls', 'Inject controls inside each browser'),
-            ('MinimizeOthers', 'Minimize others on profile select'),
-            ('RemoveShadows', 'Remove shadows'),
-        ]
-        for key, label in checks:
-            var = tk.IntVar(value=1 if self.cfg.get('MAIN', key, fallback='0') == '1' else 0)
-            self.settings_checks[key] = var
-            tk.Checkbutton(inner, text=label, variable=var, font=('Segoe UI', 8),
-                            fg=self.FG, bg=self.BG, selectcolor=self.BG2,
-                            activebackground=self.BG).grid(
-                row=row, column=0, columnspan=2, sticky='w', padx=12, pady=1)
-            row += 1
-
-        # Custom nav size
-        nav_var = tk.IntVar(value=1 if self.cfg.get('MAIN', 'UseCustomNavSize') == '1' else 0)
-        self.settings_checks['UseCustomNavSize'] = nav_var
-        tk.Checkbutton(inner, text='Use custom Click/Nav size:', variable=nav_var,
-                        font=('Segoe UI', 8), fg=self.FG, bg=self.BG,
-                        selectcolor=self.BG2, activebackground=self.BG).grid(
-            row=row, column=0, columnspan=2, sticky='w', padx=12, pady=1)
-        row += 1
-
-        sz_frame = tk.Frame(inner, bg=self.BG)
-        sz_frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=30, pady=2)
-        tk.Label(sz_frame, text='W:', font=('Consolas', 9), fg=self.FG2, bg=self.BG).pack(side='left')
-        self.settings_navw = tk.Entry(sz_frame, font=('Consolas', 9), bg=self.BG2, fg=self.FG, bd=1, width=6)
-        self.settings_navw.insert(0, self.cfg.get('MAIN', 'NavW'))
-        self.settings_navw.pack(side='left', padx=2)
-        tk.Label(sz_frame, text='H:', font=('Consolas', 9), fg=self.FG2, bg=self.BG).pack(side='left', padx=(8, 0))
-        self.settings_navh = tk.Entry(sz_frame, font=('Consolas', 9), bg=self.BG2, fg=self.FG, bd=1, width=6)
-        self.settings_navh.insert(0, self.cfg.get('MAIN', 'NavH'))
-        self.settings_navh.pack(side='left', padx=2)
-        row += 1
-
-        # Hotkeys section
-        tk.Label(inner, text='HOTKEYS', font=('Segoe UI', 9, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).grid(row=row, column=0, columnspan=2, sticky='w', pady=(10, 4), padx=8)
-        row += 1
-
-        self.settings_hotkeys = {}
+        self.hk_entries = {}
         hk_fields = [
             ('FORWARD', 'Forward'), ('BACKWARD', 'Backward'), ('TOP', 'Top'),
-            ('SORTTAB', 'Sort Tab'), ('SORTPROFILE', 'Sort Profile'),
+            ('SORTTAB', 'Sort by Tab'), ('SORTPROFILE', 'Sort by Profile'),
             ('GROUPNEXT', 'Group Next'), ('GROUPBACK', 'Group Back'),
         ]
         for key, label in hk_fields:
-            tk.Label(inner, text=label, font=('Segoe UI', 8), fg=self.FG2, bg=self.BG).grid(
-                row=row, column=0, sticky='w', padx=12)
-            entry = tk.Entry(inner, font=('Consolas', 9), bg=self.BG2, fg=self.FG, bd=1, width=22)
+            tk.Label(inner, text=label, font=('', 8)).grid(row=row, column=0, sticky='w', padx=8)
+            entry = tk.Entry(inner, font=('', 8), width=20)
             entry.insert(0, self.cfg.get('HOTKEYS', key, fallback=''))
-            entry.grid(row=row, column=1, sticky='ew', padx=8, pady=1)
-            self.settings_hotkeys[key] = entry
+            entry.grid(row=row, column=1, padx=4, pady=1)
+            self.hk_entries[key] = entry
             row += 1
 
         # Extra hotkeys
-        tk.Label(inner, text='EXTRA HOTKEYS', font=('Segoe UI', 9, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).grid(row=row, column=0, columnspan=2, sticky='w', pady=(10, 4), padx=8)
+        tk.Label(inner, text='Extra Hotkeys (9 slots)', font=('', 9, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(10, 2), padx=8)
         row += 1
 
-        self.settings_extra_hk = {}
-        for i in range(1, 10):
-            tk.Label(inner, text=f'EHK{i}', font=('Segoe UI', 8), fg=self.FG2, bg=self.BG).grid(
-                row=row, column=0, sticky='w', padx=12)
-            entry = tk.Entry(inner, font=('Consolas', 9), bg=self.BG2, fg=self.FG, bd=1, width=22)
-            val = self.cfg.get('HOTKEYS2', f'EHK{i}-0', fallback='')
-            entry.insert(0, val)
-            entry.grid(row=row, column=1, sticky='ew', padx=8, pady=1)
-            self.settings_extra_hk[f'EHK{i}'] = entry
-            row += 1
-
-        # Main settings
-        tk.Label(inner, text='MAIN', font=('Segoe UI', 9, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).grid(row=row, column=0, columnspan=2, sticky='w', pady=(10, 4), padx=8)
+        tk.Label(inner, text='Desc | Action | Key', font=('', 7)).grid(
+            row=row, column=0, columnspan=2, sticky='w', padx=8)
         row += 1
 
-        self.settings_main = {}
-        for key, label in [('PollInterval', 'Poll Interval (sec)'), ('AdsPowerPort', 'AdsPower Port')]:
-            tk.Label(inner, text=label, font=('Segoe UI', 8), fg=self.FG2, bg=self.BG).grid(
-                row=row, column=0, sticky='w', padx=12)
-            entry = tk.Entry(inner, font=('Consolas', 9), bg=self.BG2, fg=self.FG, bd=1, width=22)
-            entry.insert(0, self.cfg.get('MAIN', key))
-            entry.grid(row=row, column=1, sticky='ew', padx=8, pady=1)
-            self.settings_main[key] = entry
+        self.ehk_entries = []
+        for i in range(9):
+            fr = tk.Frame(inner)
+            fr.grid(row=row, column=0, columnspan=2, sticky='w', padx=8, pady=1)
+            e1 = tk.Entry(fr, font=('', 7), width=10)
+            e1.insert(0, self.cfg.get('HOTKEYS2', f'EHK{i+1}-0', fallback=''))
+            e1.pack(side='left', padx=1)
+            e2 = tk.Entry(fr, font=('', 7), width=10)
+            e2.insert(0, self.cfg.get('HOTKEYS2', f'EHK{i+1}-1', fallback=''))
+            e2.pack(side='left', padx=1)
+            e3 = tk.Entry(fr, font=('', 7), width=10)
+            e3.insert(0, self.cfg.get('HOTKEYS2', f'EHK{i+1}-2', fallback=''))
+            e3.pack(side='left', padx=1)
+            self.ehk_entries.append((e1, e2, e3))
             row += 1
 
-        tk.Button(inner, text='Save Settings', font=('Segoe UI', 9, 'bold'),
-                  fg='#fff', bg=self.GREEN, bd=0, padx=16, pady=4,
-                  cursor='hand2', command=self._save_settings).grid(
-            row=row, column=0, columnspan=2, pady=12)
+        # Toggle hotkey
+        fr = tk.Frame(inner)
+        fr.grid(row=row, column=0, columnspan=2, sticky='w', padx=8, pady=1)
+        tk.Label(fr, text='Toggle Extra HK:', font=('', 7)).pack(side='left')
+        self.ehk_toggle_entry = tk.Entry(fr, font=('', 7), width=15)
+        self.ehk_toggle_entry.insert(0, self.cfg.get('MAIN', 'HotkeysToggleExtra'))
+        self.ehk_toggle_entry.pack(side='left', padx=2)
+        row += 1
 
-    # ── Discord Tab ───────────────────────────────────────────────────────────
+        # Options
+        tk.Label(inner, text='Options', font=('', 9, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(10, 2), padx=8)
+        row += 1
+
+        self.opt_autosorting = tk.BooleanVar(value=self.cfg.get('MAIN', 'AutoSorting') == '1')
+        tk.Checkbutton(inner, text='Auto column sorting', variable=self.opt_autosorting).grid(
+            row=row, column=0, columnspan=2, sticky='w', padx=12)
+        row += 1
+
+        self.opt_inject = tk.BooleanVar(value=self.cfg.get('MAIN', 'InjectControls') == '1')
+        tk.Checkbutton(inner, text='Inject controls inside each browser',
+                        variable=self.opt_inject).grid(
+            row=row, column=0, columnspan=2, sticky='w', padx=12)
+        row += 1
+
+        self.opt_minimize_others = tk.BooleanVar(value=self.cfg.get('MAIN', 'MinimizeOthers') == '1')
+        tk.Checkbutton(inner, text='Minimize others on profile select',
+                        variable=self.opt_minimize_others).grid(
+            row=row, column=0, columnspan=2, sticky='w', padx=12)
+        row += 1
+
+        self.opt_custom_nav = tk.BooleanVar(value=self.cfg.get('MAIN', 'CustomNavSize') == '1')
+        cb_frame = tk.Frame(inner)
+        cb_frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=12)
+        tk.Checkbutton(cb_frame, text='Use custom Click/Nav size:', variable=self.opt_custom_nav).pack(side='left')
+        row += 1
+
+        sz_frame = tk.Frame(inner)
+        sz_frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=24)
+        tk.Label(sz_frame, text='W:').pack(side='left')
+        self.set_navw = tk.Entry(sz_frame, width=5)
+        self.set_navw.insert(0, self.cfg.get('MAIN', 'NavWidth'))
+        self.set_navw.pack(side='left', padx=2)
+        tk.Label(sz_frame, text='H:').pack(side='left')
+        self.set_navh = tk.Entry(sz_frame, width=5)
+        self.set_navh.insert(0, self.cfg.get('MAIN', 'NavHeight'))
+        self.set_navh.pack(side='left', padx=2)
+        row += 1
+
+        tk.Button(inner, text='Save Settings', command=self._save_settings).grid(
+            row=row, column=0, columnspan=2, pady=10)
+
+    # ── DISCORD TAB ───────────────────────────────────────────────────────────
 
     def _build_discord_tab(self):
-        f = self.tab_frames['Discord']
-        tk.Label(f, text='DISCORD WEBHOOKS', font=('Segoe UI', 10, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).pack(anchor='w', padx=10, pady=(10, 5))
+        f = self.tab_discord
+        row = 0
 
-        self.discord_entries = {}
-        for key, label in [('QueWebhook', 'Queue Webhook URL'), ('ProdWebhook', 'Prod Webhook URL'),
-                            ('ProfileName', 'Profile Name')]:
-            tk.Label(f, text=label, font=('Segoe UI', 8), fg=self.FG2, bg=self.BG).pack(
-                anchor='w', padx=12)
-            entry = tk.Entry(f, font=('Consolas', 9), bg=self.BG2, fg=self.FG, bd=1)
+        tk.Label(f, text='Profile Name:').grid(row=row, column=0, sticky='w', padx=8, pady=2)
+        self.dc_profile = tk.Entry(f, width=30)
+        self.dc_profile.grid(row=row, column=1, padx=4, pady=2)
+        row += 1
+
+        tk.Label(f, text='Message:').grid(row=row, column=0, sticky='w', padx=8, pady=2)
+        self.dc_message = tk.Text(f, height=3, width=30)
+        self.dc_message.grid(row=row, column=1, padx=4, pady=2)
+        row += 1
+
+        btn_frame = tk.Frame(f)
+        btn_frame.grid(row=row, column=0, columnspan=2, pady=4)
+        tk.Button(btn_frame, text='Send to QUE', command=lambda: self._discord_send('que')).pack(side='left', padx=2)
+        tk.Button(btn_frame, text='Send to PROD', command=lambda: self._discord_send('prod')).pack(side='left', padx=2)
+        tk.Button(btn_frame, text='Send VF', command=lambda: self._discord_send('vf')).pack(side='left', padx=2)
+        row += 1
+
+        btn_frame2 = tk.Frame(f)
+        btn_frame2.grid(row=row, column=0, columnspan=2, pady=2)
+        tk.Button(btn_frame2, text='PROD Screenshot', command=lambda: self._discord_screenshot('prod')).pack(side='left', padx=2)
+        tk.Button(btn_frame2, text='Screenshot Only', command=self._save_screenshot).pack(side='left', padx=2)
+        row += 1
+
+        self.dc_status = tk.Label(f, text='', fg='green')
+        self.dc_status.grid(row=row, column=0, columnspan=2, pady=2)
+        row += 1
+
+        # Webhook URLs
+        for key, label in [('QueWebhook', 'QUE Webhook:'), ('ProdWebhook', 'PROD Webhook:'),
+                            ('VfWebhook', 'VF Webhook:')]:
+            tk.Label(f, text=label, font=('', 7)).grid(row=row, column=0, sticky='w', padx=8)
+            entry = tk.Entry(f, width=35, font=('', 7))
             entry.insert(0, self.cfg.get('DISCORD', key, fallback=''))
-            entry.pack(fill='x', padx=12, pady=(0, 6))
-            self.discord_entries[key] = entry
+            entry.grid(row=row, column=1, padx=4, pady=1)
+            setattr(self, f'dc_{key.lower()}', entry)
+            row += 1
 
-        tk.Label(f, text='GOOGLE SHEETS', font=('Segoe UI', 10, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).pack(anchor='w', padx=10, pady=(10, 5))
+        tk.Label(f, text='Sheet URL:', font=('', 7)).grid(row=row, column=0, sticky='w', padx=8)
+        self.dc_sheeturl = tk.Entry(f, width=35, font=('', 7))
+        self.dc_sheeturl.insert(0, self.cfg.get('DISCORD', 'SheetUrl', fallback=''))
+        self.dc_sheeturl.grid(row=row, column=1, padx=4, pady=1)
+        row += 1
 
-        tk.Label(f, text='Sheet URL', font=('Segoe UI', 8), fg=self.FG2, bg=self.BG).pack(
-            anchor='w', padx=12)
-        self.sheet_entry = tk.Entry(f, font=('Consolas', 9), bg=self.BG2, fg=self.FG, bd=1)
-        self.sheet_entry.insert(0, self.cfg.get('SHEETS', 'SheetUrl', fallback=''))
-        self.sheet_entry.pack(fill='x', padx=12, pady=(0, 6))
+        tk.Label(f, text='Save Folder:', font=('', 7)).grid(row=row, column=0, sticky='w', padx=8)
+        folder_frame = tk.Frame(f)
+        folder_frame.grid(row=row, column=1, sticky='w', padx=4)
+        self.dc_folder = tk.Entry(folder_frame, width=25, font=('', 7))
+        self.dc_folder.insert(0, self.cfg.get('DISCORD', 'ScreenshotFolder', fallback=''))
+        self.dc_folder.pack(side='left')
+        tk.Button(folder_frame, text='...', font=('', 7), width=3,
+                  command=self._browse_screenshot_folder).pack(side='left')
+        row += 1
 
-        btn_frame = tk.Frame(f, bg=self.BG)
-        btn_frame.pack(pady=10)
-        tk.Button(btn_frame, text='Save', font=('Segoe UI', 9, 'bold'), fg='#fff',
-                  bg=self.GREEN, bd=0, padx=16, pady=4,
-                  command=self._save_discord).pack(side='left', padx=4)
-        tk.Button(btn_frame, text='Test Queue Webhook', font=('Segoe UI', 9),
-                  fg=self.FG, bg=self.BG2, bd=1, padx=8, pady=3,
-                  command=self._test_discord_queue).pack(side='left', padx=4)
-        tk.Button(btn_frame, text='Test Prod Webhook', font=('Segoe UI', 9),
-                  fg=self.FG, bg=self.BG2, bd=1, padx=8, pady=3,
-                  command=self._test_discord_prod).pack(side='left', padx=4)
+        tk.Button(f, text='Save Discord Settings', command=self._save_discord).grid(
+            row=row, column=0, columnspan=2, pady=8)
 
-    # ── Distribute Tab ────────────────────────────────────────────────────────
+    # ── DISTRIBTE TAB ─────────────────────────────────────────────────────────
 
-    def _build_distribute_tab(self):
-        f = self.tab_frames['Distribute']
-        tk.Label(f, text='AUTO DISTRIBUTE', font=('Segoe UI', 10, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).pack(anchor='w', padx=10, pady=(10, 5))
+    def _build_distribte_tab(self):
+        f = self.tab_distribte
 
-        tk.Label(f, text='Distribute URL across all running profiles evenly.',
-                 font=('Segoe UI', 9), fg=self.FG2, bg=self.BG).pack(anchor='w', padx=12, pady=4)
+        tk.Label(f, text='Distribte Auto-Login', font=('', 10, 'bold')).pack(
+            anchor='w', padx=10, pady=(10, 4))
+        tk.Label(f, text='Saves email/password to Distribte extension configs\n'
+                          'in all AdsPower profile directories.', font=('', 8)).pack(
+            anchor='w', padx=12, pady=4)
 
-        url_frame = tk.Frame(f, bg=self.BG)
-        url_frame.pack(fill='x', padx=12, pady=4)
-        tk.Label(url_frame, text='URL:', font=('Consolas', 9), fg=self.FG2, bg=self.BG).pack(side='left')
-        self.dist_url_entry = tk.Entry(url_frame, font=('Consolas', 9), bg=self.BG2,
-                                        fg=self.FG, bd=1, insertbackground=self.FG)
-        self.dist_url_entry.insert(0, 'https://www.ticketmaster.com')
-        self.dist_url_entry.pack(side='left', fill='x', expand=True, padx=4)
+        form = tk.Frame(f)
+        form.pack(padx=12, pady=4)
+        tk.Label(form, text='Email:').grid(row=0, column=0, sticky='w')
+        self.dist_email = tk.Entry(form, width=30)
+        self.dist_email.insert(0, self.cfg.get('DISTRIBTE', 'Email', fallback=''))
+        self.dist_email.grid(row=0, column=1, padx=4, pady=2)
 
-        tk.Button(f, text='Distribute Now', font=('Segoe UI', 9, 'bold'),
-                  fg='#fff', bg=self.PURPLE, bd=0, padx=16, pady=6,
-                  cursor='hand2', command=self._distribute_url).pack(pady=10)
+        tk.Label(form, text='Password:').grid(row=1, column=0, sticky='w')
+        self.dist_password = tk.Entry(form, width=30, show='*')
+        self.dist_password.insert(0, self.cfg.get('DISTRIBTE', 'Password', fallback=''))
+        self.dist_password.grid(row=1, column=1, padx=4, pady=2)
 
-        self.dist_status = tk.Label(f, text='', font=('Consolas', 9), fg=self.FG2, bg=self.BG)
-        self.dist_status.pack(padx=12, pady=4)
+        btn_frame = tk.Frame(f)
+        btn_frame.pack(pady=8)
+        tk.Button(btn_frame, text='Save & Apply', bg='#4CA070', fg='white',
+                  command=self._dist_save).pack(side='left', padx=4)
+        tk.Button(btn_frame, text='Clear', bg='#e94560', fg='white',
+                  command=self._dist_clear).pack(side='left', padx=4)
 
-    # ── Position Tab ──────────────────────────────────────────────────────────
+        self.dist_status = tk.Label(f, text='', font=('', 8))
+        self.dist_status.pack(pady=4)
+
+    # ── POSITIONER TAB ────────────────────────────────────────────────────────
 
     def _build_pos_tab(self):
-        f = self.tab_frames['Pos']
-        tk.Label(f, text='WINDOW POSITIONING', font=('Segoe UI', 10, 'bold'),
-                 fg=self.ACCENT, bg=self.BG).pack(anchor='w', padx=10, pady=(10, 5))
+        f = self.tab_pos
 
-        tk.Label(f, text='Arrange all profile windows on screen.',
-                 font=('Segoe UI', 9), fg=self.FG2, bg=self.BG).pack(anchor='w', padx=12, pady=4)
+        grid_frame = tk.Frame(f)
+        grid_frame.pack(padx=10, pady=8)
 
-        grid_frame = tk.Frame(f, bg=self.BG)
-        grid_frame.pack(pady=8)
+        self.pos_entries = {}
+        for i, (key, label, default) in enumerate([
+            ('Cols', 'Cols:', '4'), ('Rows', 'Rows:', '2'),
+            ('Width', 'Width:', '480'), ('Height', 'Height:', '540'),
+            ('GapX', 'Gap X:', '0'), ('GapY', 'Gap Y:', '0'),
+        ]):
+            row, col = divmod(i, 2)
+            tk.Label(grid_frame, text=label, font=('', 8)).grid(row=row, column=col*2, sticky='w', padx=4)
+            entry = tk.Entry(grid_frame, width=6, font=('', 8))
+            entry.insert(0, self.cfg.get('POSITIONER', key, fallback=default))
+            entry.grid(row=row, column=col*2+1, padx=2, pady=2)
+            self.pos_entries[key] = entry
 
-        layouts = [
-            ('Stack', self._pos_stack),
-            ('Tile 2x', self._pos_tile_2),
-            ('Tile 3x', self._pos_tile_3),
-            ('Cascade', self._pos_cascade),
-        ]
-        for text, cmd in layouts:
-            tk.Button(grid_frame, text=text, font=('Segoe UI', 9), fg=self.FG,
-                      bg=self.BG2, bd=1, padx=12, pady=4, width=10,
-                      cursor='hand2', command=cmd).pack(pady=3)
+        tk.Button(f, text='Position Windows', command=self._position_windows).pack(pady=4)
 
-        self.pos_status = tk.Label(f, text='', font=('Consolas', 9), fg=self.FG2, bg=self.BG)
-        self.pos_status.pack(padx=12, pady=4)
+        # URL bar
+        url_frame = tk.Frame(f)
+        url_frame.pack(fill='x', padx=10, pady=4)
+        self.pos_url = tk.Entry(url_frame, font=('', 8))
+        self.pos_url.insert(0, self.cfg.get('POSITIONER', 'URL', fallback='https://www.ticketmaster.com'))
+        self.pos_url.pack(side='left', fill='x', expand=True)
+        tk.Button(url_frame, text='Open URL', font=('', 8),
+                  command=self._pos_open_url).pack(side='left', padx=2)
+        tk.Button(url_frame, text='STOP', font=('', 8), fg='white', bg='red',
+                  command=self._stop_url).pack(side='left', padx=2)
 
-    # ── Bottom Bar ────────────────────────────────────────────────────────────
+        tk.Button(f, text='Save Positioner Settings', command=self._save_pos).pack(pady=4)
+
+        # Group buttons A-Z (larger, 9 columns)
+        tk.Label(f, text='Groups:', font=('', 8, 'bold')).pack(anchor='w', padx=10, pady=(8, 2))
+        self.pos_grp_btns = {}
+        for row_start in range(0, 26, 9):
+            row_frame = tk.Frame(f)
+            row_frame.pack(padx=10)
+            for i in range(9):
+                idx = row_start + i
+                if idx >= 26:
+                    break
+                letter = chr(65 + idx)
+                btn = tk.Button(row_frame, text=letter, font=('', 8, 'bold'),
+                                width=3, height=1,
+                                command=lambda l=idx: self._switch_group(l))
+                btn.pack(side='left', padx=1, pady=1)
+                self.pos_grp_btns[idx] = btn
+
+    # ── BOTTOM BAR ────────────────────────────────────────────────────────────
 
     def _build_bottom_bar(self):
-        # Debug log / status tabs
-        bottom_tabs = tk.Frame(self.root, bg=self.BG2)
-        bottom_tabs.pack(fill='x', side='bottom')
+        bottom = tk.Frame(self.root)
+        bottom.pack(fill='x', side='bottom', padx=4, pady=(0, 4))
 
-        self.bottom_tab_btns = {}
-        for name in ['APM v2.0', 'Debug Log']:
-            btn = tk.Button(bottom_tabs, text=name, font=('Segoe UI', 7),
-                            fg=self.FG2, bg=self.BG2, bd=0, padx=6, pady=2,
-                            command=lambda n=name: self._switch_bottom_tab(n))
-            btn.pack(side='left')
-            self.bottom_tab_btns[name] = btn
+        tk.Label(bottom, text=f'APM v{VERSION}', font=('', 7), fg='gray').pack(side='left')
 
-        self.bottom_container = tk.Frame(self.root, bg=self.BG, height=28)
-        self.bottom_container.pack(fill='x', side='bottom')
-        self.bottom_container.pack_propagate(False)
+        self.main_url = tk.Entry(bottom, font=('', 8), width=22)
+        self.main_url.insert(0, self.cfg.get('MAIN', 'MainURL'))
+        self.main_url.pack(side='left', padx=4)
 
-        # URL bar (shown in APM v2.0 tab)
-        self.url_frame = tk.Frame(self.bottom_container, bg=self.BG)
-        self.url_entry = tk.Entry(self.url_frame, font=('Consolas', 9), bg=self.BG2,
-                                   fg=self.FG, bd=1, insertbackground=self.FG)
-        self.url_entry.insert(0, 'https://www.ticketmaster.com')
-        self.url_entry.pack(side='left', fill='x', expand=True, padx=4)
-        tk.Button(self.url_frame, text='Open URL', font=('Segoe UI', 8), fg=self.FG,
-                  bg=self.BG2, bd=1, padx=4, command=self._open_url_in_all).pack(side='left', padx=2)
-        self.stop_btn = tk.Button(self.url_frame, text='STOP', font=('Segoe UI', 8, 'bold'),
-                                   fg='#fff', bg=self.ACCENT, bd=0, padx=6,
-                                   command=self._stop_all)
-        self.stop_btn.pack(side='left', padx=2)
+        tk.Button(bottom, text='Open URL', font=('', 7),
+                  command=self._open_url_all).pack(side='left', padx=2)
+        tk.Button(bottom, text='STOP', font=('', 7, 'bold'), fg='white', bg='red',
+                  command=self._stop_url).pack(side='left', padx=2)
 
-        # Debug log text
-        self.debug_frame = tk.Frame(self.bottom_container, bg=self.BG)
-        self.debug_text = tk.Text(self.debug_frame, font=('Consolas', 8), bg=self.BG,
-                                   fg=self.GREEN, height=6, bd=0, wrap='word')
-        self.debug_text.pack(fill='both', expand=True)
+        # Debug log button
+        tk.Button(bottom, text='Debug Log', font=('', 6),
+                  command=self._show_debug_log).pack(side='right', padx=2)
 
-        self._switch_bottom_tab('APM v2.0')
+    # ══════════════════════════════════════════════════════════════════════════
+    # CORE LOGIC
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _switch_bottom_tab(self, name):
-        self.url_frame.pack_forget()
-        self.debug_frame.pack_forget()
-        if name == 'APM v2.0':
-            self.bottom_container.configure(height=28)
-            self.url_frame.pack(fill='x')
-        else:
-            self.bottom_container.configure(height=120)
-            self.debug_frame.pack(fill='both', expand=True)
-            self._refresh_debug_log()
-        for n, btn in self.bottom_tab_btns.items():
-            btn.configure(fg=self.FG if n == name else self.FG2)
-
-    def _refresh_debug_log(self):
-        self.debug_text.delete('1.0', 'end')
-        self.debug_text.insert('end', '\n'.join(self.debug_log[-100:]))
-        self.debug_text.see('end')
-
-    # ── Actions ───────────────────────────────────────────────────────────────
-
-    def _cycle(self, direction):
-        if not self.profiles:
-            return
-        if self.selected_index < 0:
-            self.selected_index = 0
-        else:
-            self.selected_index = (self.selected_index + direction) % len(self.profiles)
-        self._activate_selected()
-        self._select_tree_row(self.selected_index)
-
-    def _go_top(self):
-        if self.profiles:
-            self.selected_index = 0
-            self._activate_selected()
-            self._select_tree_row(0)
-
-    def _activate_selected(self):
-        if self.selected_index < 0 or self.selected_index >= len(self.profiles):
-            return
-        profile = self.profiles[self.selected_index]
-        debug_port = profile.get('debug_port', 0)
-        if not debug_port:
+    def _get_browsers(self):
+        """Scan for SunBrowser windows - equivalent to GetBrowsers() in AutoIt."""
+        if not HAS_WIN32:
             return
 
-        custom_size = None
-        if self.cfg.get('MAIN', 'UseCustomNavSize') == '1':
-            try:
-                nw = int(self.cfg.get('MAIN', 'NavW'))
-                nh = int(self.cfg.get('MAIN', 'NavH'))
-                if nw > 0 and nh > 0:
-                    custom_size = (nw, nh)
-            except (ValueError, TypeError):
-                pass
+        chrome_windows = enum_windows()
+        new_browsers = []
 
-        minimize_others = self.cfg.get('MAIN', 'MinimizeOthers', fallback='0') == '1'
+        # Batch refresh cmdline cache every 30s
+        now = time.time()
+        if now - self.cmdline_cache_time > 30:
+            self.cmdline_cache.clear()
+            self.cmdline_cache_time = now
 
-        threading.Thread(target=activate_profile, args=(debug_port, custom_size, minimize_others),
-                          daemon=True).start()
-        self._log(f'Switched to profile #{profile.get("serial", "?")}')
+        for hwnd, title in chrome_windows:
+            pid = get_window_pid(hwnd)
+            if not pid:
+                continue
 
-    def _select_tree_row(self, index):
-        items = self.tree.get_children()
-        if 0 <= index < len(items):
-            self.tree.selection_set(items[index])
-            self.tree.see(items[index])
+            # Check SunBrowser (cache result)
+            if pid not in self.sunpid_cache:
+                self.sunpid_cache[pid] = is_sunbrowser(pid)
+            if not self.sunpid_cache[pid]:
+                continue
 
-    def _on_tree_select(self, event):
+            # Resolve profile name
+            if pid in self.pid_profile_cache:
+                profile_name = self.pid_profile_cache[pid]
+            else:
+                if pid not in self.cmdline_cache:
+                    self.cmdline_cache[pid] = get_process_cmdline(pid)
+                cmdline = self.cmdline_cache[pid]
+                user_id = get_adspower_userid_from_cmdline(cmdline)
+                if user_id:
+                    profile_name = self.api.resolve_profile_name(user_id)
+                else:
+                    # Fallback: session name from cmdline
+                    m = re.search(r'--session[_-]name=([^\s"]+)', cmdline)
+                    profile_name = m.group(1) if m else f'PID:{pid}'
+                self.pid_profile_cache[pid] = profile_name
+
+            # Tab title
+            tab_title = title if title else 'New Tab'
+
+            new_browsers.append((hwnd, title, profile_name, tab_title))
+
+        self.browsers = new_browsers
+        self.root.after(0, self._refresh_tree)
+
+    def _refresh_tree(self):
+        """Update the treeview with current browser list."""
+        # Remember selection
+        sel_items = self.tree.selection()
+        sel_hwnds = set()
+        for item in sel_items:
+            vals = self.tree.item(item, 'values')
+            if vals and len(vals) > 2:
+                sel_hwnds.add(vals[2])
+
+        self.tree.delete(*self.tree.get_children())
+
+        count = len(self.browsers)
+        self.tree.heading('profile', text=f'Profile ({count})')
+
+        for hwnd, title, profile, tab in self.browsers:
+            item = self.tree.insert('', 'end', values=(profile, tab, str(hwnd)))
+            if str(hwnd) in sel_hwnds:
+                self.tree.selection_add(item)
+
+        # Auto-sort if enabled
+        if self.opt_autosorting.get():
+            self._sort_tree(self.sort_by)
+
+    def _sort_tree(self, col):
+        self.sort_by = col
+        items = [(self.tree.set(k, ('profile', 'tab')[col]), k) for k in self.tree.get_children()]
+        items.sort(key=lambda x: x[0].lower())
+        for i, (_, k) in enumerate(items):
+            self.tree.move(k, '', i)
+
+    def _on_select(self, event):
+        if self.browser_move_in_progress:
+            return
         sel = self.tree.selection()
         if sel:
             items = self.tree.get_children()
             for i, item in enumerate(items):
-                if item in sel:
-                    self.selected_index = i
+                if item == sel[0]:
+                    self.current_pos = i
                     break
 
-    def _on_tree_double_click(self, event):
-        self._activate_selected()
+    def _get_selected_hwnds(self):
+        """Get HWNDs of selected items."""
+        hwnds = []
+        for item in self.tree.selection():
+            vals = self.tree.item(item, 'values')
+            if vals and len(vals) > 2:
+                try:
+                    hwnds.append(int(vals[2]))
+                except (ValueError, TypeError):
+                    pass
+        return hwnds
 
-    def _select_group(self, letter):
-        """Filter profiles by group letter."""
-        if self.current_group == letter:
-            self.current_group = None  # Toggle off
-            for btn in self.grp_btn_map.values():
-                btn.configure(bg=self.BG2)
-        else:
-            self.current_group = letter
-            for l, btn in self.grp_btn_map.items():
-                btn.configure(bg=self.PURPLE if l == letter else self.BG2)
-        self._refresh_tree()
+    def _get_all_hwnds(self):
+        """Get all HWNDs from treeview."""
+        hwnds = []
+        for item in self.tree.get_children():
+            vals = self.tree.item(item, 'values')
+            if vals and len(vals) > 2:
+                try:
+                    hwnds.append(int(vals[2]))
+                except (ValueError, TypeError):
+                    pass
+        return hwnds
 
-    def _sort_column(self, col):
-        items = [(self.tree.set(k, col), k) for k in self.tree.get_children()]
-        items.sort()
-        for i, (_, k) in enumerate(items):
-            self.tree.move(k, '', i)
+    # ── Navigation ────────────────────────────────────────────────────────────
 
-    def _on_scroll(self, val):
-        if not self.profiles:
+    def _move_fwd(self):
+        self._browser_move('fwd')
+
+    def _move_back(self):
+        self._browser_move('bck')
+
+    def _move_top(self):
+        self._browser_move('top')
+
+    def _browser_move(self, direction):
+        items = self.tree.get_children()
+        if not items:
             return
-        idx = int(float(val) * len(self.profiles) / 100)
-        idx = max(0, min(idx, len(self.profiles) - 1))
-        self.selected_index = idx
-        self._select_tree_row(idx)
-
-    def _apply_nav_size(self):
+        self.browser_move_in_progress = True
         try:
-            w = int(self.nav_w_entry.get())
-            h = int(self.nav_h_entry.get())
-            self.cfg.set('MAIN', 'NavW', str(w))
-            self.cfg.set('MAIN', 'NavH', str(h))
-            save_config(self.cfg)
-            self._log(f'Nav size set to {w}x{h}')
-        except ValueError:
-            pass
+            count = len(items)
+            if direction == 'fwd':
+                self.current_pos = (self.current_pos + 1) % count
+            elif direction == 'bck':
+                self.current_pos = (self.current_pos - 1) % count
+            elif direction == 'top':
+                self.current_pos = 0
 
-    def _fix_windows(self):
-        """Resize all profile windows to the nav size."""
-        try:
-            w = int(self.nav_w_entry.get())
-            h = int(self.nav_h_entry.get())
-        except ValueError:
-            return
+            item = items[self.current_pos]
+            self.tree.selection_set(item)
+            self.tree.see(item)
 
-        def do_fix():
-            count = 0
-            for p in self.profiles:
-                port = p.get('debug_port', 0)
-                if not port:
-                    continue
-                hwnd = find_profile_window(port)
-                if hwnd:
+            vals = self.tree.item(item, 'values')
+            if vals and len(vals) > 2:
+                hwnd = int(vals[2])
+
+                # Minimize others if enabled
+                if self.opt_minimize_others.get():
+                    for other_item in items:
+                        if other_item != item:
+                            other_vals = self.tree.item(other_item, 'values')
+                            if other_vals and len(other_vals) > 2:
+                                try:
+                                    minimize_window(int(other_vals[2]))
+                                except Exception:
+                                    pass
+
+                # Apply custom nav size
+                if self.opt_custom_nav.get():
                     try:
-                        rect = win32gui.GetWindowRect(hwnd)
-                        position_window(hwnd, rect[0], rect[1], w, h)
-                        count += 1
+                        nw = int(self.main_w_entry.get())
+                        nh = int(self.main_h_entry.get())
+                        # Get current position
+                        rect = ctypes.wintypes.RECT()
+                        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                        set_window_pos(hwnd, rect.left, rect.top, nw, nh)
                     except Exception:
-                        pass
-            self.root.after(0, lambda: self._log(f'Fixed {count} windows to {w}x{h}'))
-
-        threading.Thread(target=do_fix, daemon=True).start()
-
-    # ── Side button handlers ──────────────────────────────────────────────────
-
-    def _btn_show(self):
-        self._activate_selected()
-
-    def _btn_minimize(self):
-        if self.selected_index < 0 or self.selected_index >= len(self.profiles):
-            return
-        port = self.profiles[self.selected_index].get('debug_port', 0)
-        if port:
-            hwnd = find_profile_window(port)
-            if hwnd:
-                minimize_window(hwnd)
-
-    def _btn_refresh_all(self):
-        self._log('Refreshing profiles...')
-        # Force immediate poll
-        threading.Thread(target=self._poll_once, daemon=True).start()
-
-    def _btn_close_all(self):
-        """Close all tabs in all profiles."""
-        def do_close():
-            for p in self.profiles:
-                port = p.get('debug_port', 0)
-                if port:
-                    cdp_close_tabs(port)
-            self.root.after(0, lambda: self._log('Closed tabs in all profiles'))
-        threading.Thread(target=do_close, daemon=True).start()
-
-    def _btn_close_selected(self):
-        if self.selected_index < 0 or self.selected_index >= len(self.profiles):
-            return
-        port = self.profiles[self.selected_index].get('debug_port', 0)
-        if port:
-            threading.Thread(target=cdp_close_tabs, args=(port,), daemon=True).start()
-            self._log(f'Closing tabs for profile #{self.profiles[self.selected_index].get("serial", "?")}')
-
-    def _btn_show_all(self):
-        def do_show():
-            for p in self.profiles:
-                port = p.get('debug_port', 0)
-                if port:
-                    hwnd = find_profile_window(port)
-                    if hwnd:
                         show_window(hwnd)
-                        time.sleep(0.1)
-        threading.Thread(target=do_show, daemon=True).start()
+                else:
+                    show_window(hwnd)
+        finally:
+            self.browser_move_in_progress = False
 
-    def _btn_minimize_all(self):
-        def do_min():
-            for p in self.profiles:
-                port = p.get('debug_port', 0)
-                if port:
-                    hwnd = find_profile_window(port)
-                    if hwnd:
+    # ── Browser Actions ───────────────────────────────────────────────────────
+
+    def _browser_action(self, action, all_=False):
+        if all_:
+            hwnds = self._get_all_hwnds()
+        else:
+            hwnds = self._get_selected_hwnds()
+
+        if not hwnds:
+            return
+
+        if action == 'close' and len(hwnds) > 1:
+            if not messagebox.askyesno('Confirm', f'Close {len(hwnds)} windows?'):
+                return
+
+        def do_action():
+            for hwnd in hwnds:
+                try:
+                    if not is_window_visible(hwnd):
+                        continue
+                    if action == 'show':
+                        show_window(hwnd)
+                    elif action == 'minimize':
                         minimize_window(hwnd)
-        threading.Thread(target=do_min, daemon=True).start()
+                    elif action == 'close':
+                        close_window(hwnd)
+                        time.sleep(0.5)
+                        if is_window_visible(hwnd):
+                            user32.DestroyWindow(hwnd)
+                    elif action == 'refresh':
+                        show_window(hwnd)
+                        time.sleep(0.3)
+                        send_keys_to_window(hwnd, ['{F5}'])
+                        time.sleep(0.5)
+                except Exception:
+                    pass
+
+        threading.Thread(target=do_action, daemon=True).start()
+
+    # ── Groups ────────────────────────────────────────────────────────────────
+
+    def _switch_group(self, group_index):
+        """Switch to group (virtual partition based on Cols*Rows)."""
+        if self.active_group == group_index:
+            # Toggle off
+            self.active_group = -1
+            for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
+                btn.configure(bg='SystemButtonFace')
+            # Show all
+            threading.Thread(target=self._show_all_browsers, daemon=True).start()
+            return
+
+        self.active_group = group_index
+        # Highlight button
+        for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
+            btn.configure(bg='#4CA070' if idx == group_index else 'SystemButtonFace')
+
+        # Calculate group window range
+        try:
+            cols = int(self.pos_entries.get('Cols', tk.Entry()).get() or '4')
+            rows = int(self.pos_entries.get('Rows', tk.Entry()).get() or '2')
+            width = int(self.pos_entries.get('Width', tk.Entry()).get() or '480')
+            height = int(self.pos_entries.get('Height', tk.Entry()).get() or '540')
+            gap_x = int(self.pos_entries.get('GapX', tk.Entry()).get() or '0')
+            gap_y = int(self.pos_entries.get('GapY', tk.Entry()).get() or '0')
+        except (ValueError, TypeError):
+            cols, rows, width, height, gap_x, gap_y = 4, 2, 480, 540, 0, 0
+
+        group_size = cols * rows
+        start = group_index * group_size
+        end = start + group_size
+
+        def do_switch():
+            hwnds = self._get_all_hwnds()
+            for i, hwnd in enumerate(hwnds):
+                if start <= i < end:
+                    col = (i - start) % cols
+                    row = (i - start) // cols
+                    x = col * (width + gap_x)
+                    y = row * (height + gap_y)
+                    set_window_pos(hwnd, x, y, width, height)
+                else:
+                    minimize_window(hwnd)
+
+        threading.Thread(target=do_switch, daemon=True).start()
+
+    def _show_all_browsers(self):
+        for hwnd in self._get_all_hwnds():
+            show_window(hwnd)
+            time.sleep(0.05)
+
+    # ── Resize ────────────────────────────────────────────────────────────────
+
+    def _apply_resize(self):
+        """Resize selected window to W/H."""
+        hwnds = self._get_selected_hwnds()
+        if not hwnds:
+            return
+        try:
+            w = int(self.main_w_entry.get())
+            h = int(self.main_h_entry.get())
+        except ValueError:
+            return
+        self.cfg.set('MAIN', 'NavWidth', str(w))
+        self.cfg.set('MAIN', 'NavHeight', str(h))
+        save_config(self.cfg)
+
+        def do_resize():
+            for hwnd in hwnds:
+                rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                set_window_pos(hwnd, rect.left, rect.top, w, h)
+        threading.Thread(target=do_resize, daemon=True).start()
+
+    def _fix_all_sizes(self):
+        """Fix all browser windows to W/H."""
+        try:
+            w = int(self.main_w_entry.get())
+            h = int(self.main_h_entry.get())
+        except ValueError:
+            return
+        def do_fix():
+            for hwnd in self._get_all_hwnds():
+                rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                set_window_pos(hwnd, rect.left, rect.top, w, h)
+        threading.Thread(target=do_fix, daemon=True).start()
 
     # ── TM Lite ───────────────────────────────────────────────────────────────
 
-    def _toggle_tm_lite(self):
-        self.tm_lite_active = not self.tm_lite_active
-        self.tm_lite_btn.configure(bg=self.GREEN if self.tm_lite_active else self.ACCENT)
-        self._log(f'TM Lite {"ON" if self.tm_lite_active else "OFF"}')
+    def _tm_lite_all(self):
+        """Send Alt+L to all browser windows (TM Lite toggle)."""
+        def do_it():
+            for hwnd in self._get_all_hwnds():
+                show_window(hwnd)
+                time.sleep(0.2)
+                send_keys_to_window(hwnd, ['!l'])
+                time.sleep(0.3)
+            self.root.after(0, lambda: user32.SetForegroundWindow(
+                int(self.root.winfo_id())) if HAS_WIN32 else None)
+        threading.Thread(target=do_it, daemon=True).start()
+
+    # ── URL Opening ───────────────────────────────────────────────────────────
+
+    def _open_url_all(self):
+        url = self.main_url.get().strip()
+        if not url:
+            return
+        self.stop_url_loop = False
+
+        def do_open():
+            set_clipboard(url)
+            for hwnd in self._get_all_hwnds():
+                if self.stop_url_loop:
+                    break
+                show_window(hwnd)
+                time.sleep(0.3)
+                send_keys_to_window(hwnd, ['^t'])
+                time.sleep(0.2)
+                send_keys_to_window(hwnd, ['^l'])
+                time.sleep(0.1)
+                send_keys_to_window(hwnd, ['^v'])
+                time.sleep(0.1)
+                send_keys_to_window(hwnd, ['{ENTER}'])
+                time.sleep(0.5)
+            self.root.after(0, lambda: self._log('URL open complete'))
+
+        threading.Thread(target=do_open, daemon=True).start()
+
+    def _pos_open_url(self):
+        url = self.pos_url.get().strip()
+        if not url:
+            return
+        self.stop_url_loop = False
+        old_url = self.main_url.get()
+        self.main_url.delete(0, 'end')
+        self.main_url.insert(0, url)
+        self._open_url_all()
+        self.main_url.delete(0, 'end')
+        self.main_url.insert(0, old_url)
+
+    def _stop_url(self):
+        self.stop_url_loop = True
+
+    # ── Position Windows ──────────────────────────────────────────────────────
+
+    def _position_windows(self):
+        try:
+            cols = int(self.pos_entries['Cols'].get())
+            rows = int(self.pos_entries['Rows'].get())
+            width = int(self.pos_entries['Width'].get())
+            height = int(self.pos_entries['Height'].get())
+            gap_x = int(self.pos_entries['GapX'].get())
+            gap_y = int(self.pos_entries['GapY'].get())
+        except ValueError:
+            return
+
+        def do_pos():
+            hwnds = self._get_all_hwnds()
+            for i, hwnd in enumerate(hwnds):
+                col = i % cols
+                row = i // cols
+                x = col * (width + gap_x)
+                y = row * (height + gap_y)
+                set_window_pos(hwnd, x, y, width, height)
+        threading.Thread(target=do_pos, daemon=True).start()
+
+    def _save_pos(self):
+        for key, entry in self.pos_entries.items():
+            self.cfg.set('POSITIONER', key, entry.get())
+        self.cfg.set('POSITIONER', 'URL', self.pos_url.get())
+        save_config(self.cfg)
+        self._log('Positioner settings saved')
+
+    # ── Distribte ─────────────────────────────────────────────────────────────
+
+    def _dist_save(self):
+        email = self.dist_email.get().strip()
+        password = self.dist_password.get().strip()
+        if not email or not password:
+            self.dist_status.configure(text='Email and password required', fg='red')
+            return
+        self.cfg.set('DISTRIBTE', 'Email', email)
+        self.cfg.set('DISTRIBTE', 'Password', password)
+        save_config(self.cfg)
+
+        def do_save():
+            configs = find_distribte_configs()
+            count = 0
+            for path in configs:
+                if write_distribte_config(path, email, password):
+                    count += 1
+            self.root.after(0, lambda: self.dist_status.configure(
+                text=f'Saved to {count} config files', fg='green'))
+
+        threading.Thread(target=do_save, daemon=True).start()
+        self.dist_status.configure(text='Searching configs...', fg='blue')
+
+    def _dist_clear(self):
+        self.cfg.set('DISTRIBTE', 'Email', '')
+        self.cfg.set('DISTRIBTE', 'Password', '')
+        save_config(self.cfg)
+        self.dist_email.delete(0, 'end')
+        self.dist_password.delete(0, 'end')
+
+        def do_clear():
+            configs = find_distribte_configs()
+            count = 0
+            for path in configs:
+                if write_distribte_config(path, '', '', enabled=False):
+                    count += 1
+            self.root.after(0, lambda: self.dist_status.configure(
+                text=f'Cleared {count} config files', fg='orange'))
+
+        threading.Thread(target=do_clear, daemon=True).start()
+
+    # ── Discord ───────────────────────────────────────────────────────────────
+
+    def _discord_send(self, channel):
+        webhook = {
+            'que': self.dc_quewebhook.get(),
+            'prod': self.dc_prodwebhook.get(),
+            'vf': self.dc_vfwebhook.get(),
+        }.get(channel, '')
+
+        profile = self.dc_profile.get().strip() or 'APM'
+        message = self.dc_message.get('1.0', 'end').strip()
+        content = f'**{profile}**: {message}' if message else f'**{profile}** queue update'
+
+        def do_send():
+            ok = discord_webhook_send_text(webhook, content, username=profile)
+            self.root.after(0, lambda: self.dc_status.configure(
+                text='Sent!' if ok else 'Failed', fg='green' if ok else 'red'))
+
+        threading.Thread(target=do_send, daemon=True).start()
+
+    def _discord_screenshot(self, channel):
+        webhook = {
+            'prod': self.dc_prodwebhook.get(),
+            'que': self.dc_quewebhook.get(),
+        }.get(channel, '')
+
+        profile = self.dc_profile.get().strip() or 'APM'
+
+        def do_send():
+            img_bytes = generate_profile_image(self.browsers)
+            if not img_bytes:
+                self.root.after(0, lambda: self.dc_status.configure(text='Failed to generate image', fg='red'))
+                return
+            url = discord_webhook_upload_image(webhook, img_bytes, username=profile)
+
+            # Log to sheets
+            sheet_url = self.dc_sheeturl.get().strip()
+            if sheet_url and url:
+                sheet_name = 'PRODUCTION' if channel == 'prod' else 'QUEUE'
+                rows = []
+                for _, _, prof, tab in self.browsers:
+                    rows.append({
+                        'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'vaname': profile, 'profileid': prof,
+                        'tab': tab, 'message': '', 'screenshot': url,
+                    })
+                log_to_google_sheets(sheet_url, sheet_name, rows)
+
+            # Save locally
+            folder = self.dc_folder.get().strip()
+            if folder and img_bytes:
+                date_folder = os.path.join(folder, datetime.now().strftime('%Y-%m-%d'), channel)
+                os.makedirs(date_folder, exist_ok=True)
+                ts = datetime.now().strftime('%H%M%S')
+                with open(os.path.join(date_folder, f'{ts}.png'), 'wb') as f:
+                    f.write(img_bytes)
+
+            self.root.after(0, lambda: self.dc_status.configure(text='Screenshot sent!', fg='green'))
+
+        threading.Thread(target=do_send, daemon=True).start()
+
+    def _save_screenshot(self):
+        img_bytes = generate_profile_image(self.browsers)
+        if not img_bytes:
+            return
+        folder = self.dc_folder.get().strip()
+        if not folder:
+            return
+        os.makedirs(folder, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        with open(os.path.join(folder, f'screenshot_{ts}.png'), 'wb') as f:
+            f.write(img_bytes)
+        self.dc_status.configure(text='Screenshot saved!', fg='green')
+
+    def _browse_screenshot_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.dc_folder.delete(0, 'end')
+            self.dc_folder.insert(0, folder)
+
+    def _save_discord(self):
+        self.cfg.set('DISCORD', 'QueWebhook', self.dc_quewebhook.get())
+        self.cfg.set('DISCORD', 'ProdWebhook', self.dc_prodwebhook.get())
+        self.cfg.set('DISCORD', 'VfWebhook', self.dc_vfwebhook.get())
+        self.cfg.set('DISCORD', 'ProfileName', self.dc_profile.get())
+        self.cfg.set('DISCORD', 'ScreenshotFolder', self.dc_folder.get())
+        self.cfg.set('DISCORD', 'SheetUrl', self.dc_sheeturl.get())
+        save_config(self.cfg)
+        self.dc_status.configure(text='Settings saved', fg='green')
+
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    def _save_settings(self):
+        # Hotkeys
+        for key, entry in self.hk_entries.items():
+            self.cfg.set('HOTKEYS', key, entry.get())
+        # Extra hotkeys
+        if not self.cfg.has_section('HOTKEYS2'):
+            self.cfg.add_section('HOTKEYS2')
+        for i, (e1, e2, e3) in enumerate(self.ehk_entries):
+            self.cfg.set('HOTKEYS2', f'EHK{i+1}-0', e1.get())
+            self.cfg.set('HOTKEYS2', f'EHK{i+1}-1', e2.get())
+            self.cfg.set('HOTKEYS2', f'EHK{i+1}-2', e3.get())
+        self.cfg.set('MAIN', 'HotkeysToggleExtra', self.ehk_toggle_entry.get())
+        # Options
+        self.cfg.set('MAIN', 'AutoSorting', '1' if self.opt_autosorting.get() else '0')
+        self.cfg.set('MAIN', 'InjectControls', '1' if self.opt_inject.get() else '0')
+        self.cfg.set('MAIN', 'MinimizeOthers', '1' if self.opt_minimize_others.get() else '0')
+        self.cfg.set('MAIN', 'CustomNavSize', '1' if self.opt_custom_nav.get() else '0')
+        self.cfg.set('MAIN', 'NavWidth', self.set_navw.get())
+        self.cfg.set('MAIN', 'NavHeight', self.set_navh.get())
+        save_config(self.cfg)
+        # Re-register hotkeys
+        self._unregister_hotkeys()
+        self._register_hotkeys()
+        self._log('Settings saved')
+
+    def _load_all_settings(self):
+        """Load Discord entries from config."""
+        self.dc_profile.delete(0, 'end')
+        self.dc_profile.insert(0, self.cfg.get('DISCORD', 'ProfileName', fallback=''))
 
     # ── Toggles ───────────────────────────────────────────────────────────────
 
     def _toggle_hotkeys(self):
-        self.hotkeys_enabled = self.hotkeys_var.get()
-        self._log(f'Hotkeys {"enabled" if self.hotkeys_enabled else "disabled"}')
+        self.hotkeys_on = self.hotkeys_var.get()
+        self.cfg.set('MAIN', 'AllHotkeysON', '1' if self.hotkeys_on else '0')
+        save_config(self.cfg)
 
     def _toggle_ontop(self):
-        self.always_on_top = self.ontop_var.get()
-        self.root.attributes('-topmost', self.always_on_top)
-        self.cfg.set('MAIN', 'AlwaysOnTop', '1' if self.always_on_top else '0')
+        on = self.ontop_var.get()
+        self.root.attributes('-topmost', on)
+        self.cfg.set('MAIN', 'AlwaysOnTop', '1' if on else '0')
         save_config(self.cfg)
-
-    # ── URL / Stop ────────────────────────────────────────────────────────────
-
-    def _open_url_in_all(self):
-        url = self.url_entry.get().strip()
-        if not url or url == 'https://':
-            return
-
-        def do_open():
-            count = 0
-            for p in self.profiles:
-                port = p.get('debug_port', 0)
-                if port and cdp_open_tab(port, url):
-                    count += 1
-            self.root.after(0, lambda: self._log(f'Opened URL in {count}/{len(self.profiles)} profiles'))
-
-        threading.Thread(target=do_open, daemon=True).start()
-
-    def _stop_all(self):
-        """Stop loading in all profiles by navigating to about:blank in active tabs."""
-        self._log('Stopping all...')
-
-    # ── Distribute ────────────────────────────────────────────────────────────
-
-    def _distribute_url(self):
-        url = self.dist_url_entry.get().strip()
-        if not url:
-            return
-
-        def do_dist():
-            count = 0
-            for p in self.profiles:
-                port = p.get('debug_port', 0)
-                if port and cdp_open_tab(port, url):
-                    count += 1
-            self.root.after(0, lambda: self.dist_status.configure(
-                text=f'Distributed to {count}/{len(self.profiles)} profiles'))
-
-        threading.Thread(target=do_dist, daemon=True).start()
-        self.dist_status.configure(text='Distributing...')
-
-    # ── Position layouts ──────────────────────────────────────────────────────
-
-    def _get_screen_size(self):
-        if HAS_WIN32:
-            return (win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-                    win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
-        return (1920, 1080)
-
-    def _pos_stack(self):
-        sw, sh = self._get_screen_size()
-        def do_it():
-            for p in self.profiles:
-                port = p.get('debug_port', 0)
-                if port:
-                    hwnd = find_profile_window(port)
-                    if hwnd:
-                        position_window(hwnd, 0, 0, sw, sh - 40)
-        threading.Thread(target=do_it, daemon=True).start()
-
-    def _pos_tile_2(self):
-        sw, sh = self._get_screen_size()
-        half_w = sw // 2
-        def do_it():
-            for i, p in enumerate(self.profiles):
-                port = p.get('debug_port', 0)
-                if port:
-                    hwnd = find_profile_window(port)
-                    if hwnd:
-                        x = (i % 2) * half_w
-                        y = (i // 2) * (sh // 2)
-                        position_window(hwnd, x, y, half_w, sh // 2)
-        threading.Thread(target=do_it, daemon=True).start()
-
-    def _pos_tile_3(self):
-        sw, sh = self._get_screen_size()
-        third_w = sw // 3
-        def do_it():
-            for i, p in enumerate(self.profiles):
-                port = p.get('debug_port', 0)
-                if port:
-                    hwnd = find_profile_window(port)
-                    if hwnd:
-                        x = (i % 3) * third_w
-                        y = (i // 3) * (sh // 2)
-                        position_window(hwnd, x, y, third_w, sh // 2)
-        threading.Thread(target=do_it, daemon=True).start()
-
-    def _pos_cascade(self):
-        def do_it():
-            offset = 30
-            for i, p in enumerate(self.profiles):
-                port = p.get('debug_port', 0)
-                if port:
-                    hwnd = find_profile_window(port)
-                    if hwnd:
-                        position_window(hwnd, offset * i, offset * i, 800, 600)
-        threading.Thread(target=do_it, daemon=True).start()
-
-    # ── Discord handlers ──────────────────────────────────────────────────────
-
-    def _save_discord(self):
-        for key, entry in self.discord_entries.items():
-            self.cfg.set('DISCORD', key, entry.get())
-        self.cfg.set('SHEETS', 'SheetUrl', self.sheet_entry.get())
-        save_config(self.cfg)
-        self._log('Discord/Sheets settings saved')
-
-    def _test_discord_queue(self):
-        url = self.discord_entries['QueWebhook'].get()
-        name = self.discord_entries['ProfileName'].get() or 'APM'
-        threading.Thread(target=send_discord, args=(url, f'[{name}] APM Queue Test', 'APM'),
-                          daemon=True).start()
-        self._log('Sent test to queue webhook')
-
-    def _test_discord_prod(self):
-        url = self.discord_entries['ProdWebhook'].get()
-        name = self.discord_entries['ProfileName'].get() or 'APM'
-        threading.Thread(target=send_discord, args=(url, f'[{name}] APM Prod Test', 'APM'),
-                          daemon=True).start()
-        self._log('Sent test to prod webhook')
-
-    # ── Settings save ─────────────────────────────────────────────────────────
-
-    def _save_settings(self):
-        for key, var in self.settings_checks.items():
-            self.cfg.set('MAIN', key, '1' if var.get() else '0')
-        self.cfg.set('MAIN', 'NavW', self.settings_navw.get())
-        self.cfg.set('MAIN', 'NavH', self.settings_navh.get())
-        for key, entry in self.settings_hotkeys.items():
-            self.cfg.set('HOTKEYS', key, entry.get())
-        for key, entry in self.settings_extra_hk.items():
-            if not self.cfg.has_section('HOTKEYS2'):
-                self.cfg.add_section('HOTKEYS2')
-            self.cfg.set('HOTKEYS2', f'{key}-0', entry.get())
-        for key, entry in self.settings_main.items():
-            self.cfg.set('MAIN', key, entry.get())
-        save_config(self.cfg)
-        # Re-register hotkeys
-        if keyboard:
-            try:
-                keyboard.unhook_all_hotkeys()
-            except Exception:
-                pass
-            self._register_hotkeys()
-        self._log('Settings saved')
 
     # ── Hotkeys ───────────────────────────────────────────────────────────────
 
     def _register_hotkeys(self):
-        if not keyboard:
+        try:
+            import keyboard as kb
+        except ImportError:
             return
         try:
-            fwd = self.cfg.get('HOTKEYS', 'FORWARD')
-            bwd = self.cfg.get('HOTKEYS', 'BACKWARD')
-            top = self.cfg.get('HOTKEYS', 'TOP', fallback='')
-            grpn = self.cfg.get('HOTKEYS', 'GROUPNEXT', fallback='')
-            grpb = self.cfg.get('HOTKEYS', 'GROUPBACK', fallback='')
+            fwd = self.cfg.get('HOTKEYS', 'FORWARD').lower().replace('none', '')
+            bwd = self.cfg.get('HOTKEYS', 'BACKWARD').lower().replace('none', '')
+            top = self.cfg.get('HOTKEYS', 'TOP').lower().replace('none', '')
+            srt = self.cfg.get('HOTKEYS', 'SORTTAB', fallback='').lower().replace('none', '')
+            srp = self.cfg.get('HOTKEYS', 'SORTPROFILE', fallback='').lower().replace('none', '')
 
             if fwd:
-                keyboard.add_hotkey(fwd, lambda: self.root.after(0, self._hk_forward), suppress=False)
+                kb.add_hotkey(fwd, lambda: self.root.after(0, self._hk_fwd), suppress=False)
             if bwd:
-                keyboard.add_hotkey(bwd, lambda: self.root.after(0, self._hk_backward), suppress=False)
+                kb.add_hotkey(bwd, lambda: self.root.after(0, self._hk_bck), suppress=False)
             if top:
-                keyboard.add_hotkey(top, lambda: self.root.after(0, self._go_top), suppress=False)
+                kb.add_hotkey(top, lambda: self.root.after(0, self._move_top), suppress=False)
+            if srt:
+                kb.add_hotkey(srt, lambda: self.root.after(0, lambda: self._sort_tree(1)), suppress=False)
+            if srp:
+                kb.add_hotkey(srp, lambda: self.root.after(0, lambda: self._sort_tree(0)), suppress=False)
         except Exception as e:
             self._log(f'Hotkey error: {e}')
 
-    def _hk_forward(self):
-        if self.hotkeys_enabled:
-            self._cycle(1)
+    def _unregister_hotkeys(self):
+        try:
+            import keyboard as kb
+            kb.unhook_all_hotkeys()
+        except Exception:
+            pass
 
-    def _hk_backward(self):
-        if self.hotkeys_enabled:
-            self._cycle(-1)
+    def _hk_fwd(self):
+        if self.hotkeys_on:
+            self._move_fwd()
+
+    def _hk_bck(self):
+        if self.hotkeys_on:
+            self._move_back()
 
     # ── Polling ───────────────────────────────────────────────────────────────
 
     def _start_polling(self):
-        threading.Thread(target=self._poll_loop, daemon=True).start()
+        """Start background polling for browser windows."""
+        def poll_loop():
+            while self.running:
+                self._get_browsers()
+                time.sleep(1.5)  # Smoother than AutoIt's 1000ms
 
-    def _poll_loop(self):
-        while self.running:
-            self._poll_once()
-            try:
-                interval = int(self.cfg.get('MAIN', 'PollInterval', fallback='3'))
-            except (ValueError, TypeError):
-                interval = 3
-            time.sleep(max(1, interval))
+        threading.Thread(target=poll_loop, daemon=True).start()
 
-    def _poll_once(self):
-        try:
-            profiles = self.api.get_active_profiles()
-            self.profiles = profiles
+        # Refresh AdsPower cache periodically
+        def cache_loop():
+            while self.running:
+                self.api.get_user_list(force=True)
+                time.sleep(30)
+        threading.Thread(target=cache_loop, daemon=True).start()
 
-            # Scan tabs and queues for each profile
-            for p in profiles:
-                serial = p.get('serial') or p.get('custom') or p.get('uid') or ''
-                port = p.get('debug_port', 0)
-                if not serial or not port:
-                    continue
+    # ── Debug Log ─────────────────────────────────────────────────────────────
 
-                # Get tab titles
-                tabs = get_profile_tabs(port)
-                tab_titles = []
-                for t in tabs:
-                    title = t.get('title', '')
-                    url = t.get('url', '')
-                    if title:
-                        tab_titles.append(title[:50])
-                    elif url:
-                        tab_titles.append(url[:50])
-                self.profile_tabs[serial] = tab_titles
-
-                # Scan for queue
-                result = cdp_eval_queue(port, timeout=3)
-                if result:
-                    self.queue_data[serial] = result
-
-            self.root.after(0, self._refresh_tree)
-        except Exception as e:
-            self._log(f'Poll error: {e}')
-
-    def _refresh_tree(self):
-        """Update the treeview with current profile data."""
-        # Remember selection
-        sel_serial = None
-        if 0 <= self.selected_index < len(self.profiles):
-            sel_serial = self.profiles[self.selected_index].get('serial', '')
-
-        self.tree.delete(*self.tree.get_children())
-
-        filtered = self.profiles
-        if self.current_group:
-            filtered = [p for p in self.profiles if
-                        (p.get('group_name', '') or '').upper().startswith(self.current_group) or
-                        (p.get('name', '') or '').upper().startswith(self.current_group)]
-            if not filtered:
-                filtered = self.profiles  # Fallback: show all if no match
-
-        new_selected = -1
-        for i, p in enumerate(filtered):
-            serial = p.get('serial') or p.get('custom') or p.get('uid') or '?'
-            tabs = self.profile_tabs.get(serial, [])
-            qdata = self.queue_data.get(serial, {})
-
-            # Profile column: serial + queue number
-            profile_text = f'#{serial}'
-            q = qdata.get('queue_number')
-            if q:
-                profile_text += f' [Q#{q:,}]'
-
-            # Tab column: first tab title or queue event
-            tab_text = tabs[0] if tabs else ''
-            if not tab_text and qdata.get('title'):
-                tab_text = qdata['title'][:50]
-
-            item = self.tree.insert('', 'end', values=(profile_text, tab_text))
-
-            if serial == sel_serial:
-                new_selected = i
-                self.tree.selection_set(item)
-
-        self.selected_index = new_selected if new_selected >= 0 else (0 if filtered else -1)
-
-        # Update scroll scale
-        if self.profiles:
-            self.scroll_scale.configure(to=len(self.profiles) - 1)
-
-    # ── Screenshot ────────────────────────────────────────────────────────────
-
-    def _take_screenshot(self):
-        if not HAS_PIL:
-            self._log('PIL not available for screenshots')
-            return
-        folder = self.cfg.get('SCREENSHOTS', 'Folder', fallback=SCREENSHOT_DIR)
-        os.makedirs(folder, exist_ok=True)
-        serial = ''
-        if 0 <= self.selected_index < len(self.profiles):
-            serial = self.profiles[self.selected_index].get('serial', '')
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        name = f'{serial}_{ts}.png' if serial else f'screenshot_{ts}.png'
-        path = os.path.join(folder, name)
-        try:
-            img = ImageGrab.grab()
-            img.save(path)
-            self._log(f'Screenshot saved: {name}')
-        except Exception as e:
-            self._log(f'Screenshot error: {e}')
+    def _show_debug_log(self):
+        win = tk.Toplevel(self.root)
+        win.title('Debug Log')
+        win.geometry('500x300')
+        text = tk.Text(win, font=('Consolas', 8), bg='black', fg='#00ff00')
+        text.pack(fill='both', expand=True)
+        text.insert('end', '\n'.join(self.debug_log[-200:]))
+        text.see('end')
 
     # ── Close ─────────────────────────────────────────────────────────────────
 
@@ -1538,31 +1654,20 @@ class APMApp:
         except Exception:
             pass
         self.running = False
-        if keyboard:
-            try:
-                keyboard.unhook_all_hotkeys()
-            except Exception:
-                pass
+        self._unregister_hotkeys()
         self.root.destroy()
 
     def run(self):
         self.root.mainloop()
 
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ─── Entry ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    missing = []
     if not requests:
-        missing.append('requests')
-    if not websocket:
-        missing.append('websocket-client')
-    if missing:
         root = tk.Tk()
         root.withdraw()
-        messagebox.showerror('APM - Missing Dependencies',
-                              f'Missing packages: {", ".join(missing)}\n\n'
-                              f'Install with:\npip install {" ".join(missing)}')
+        messagebox.showerror('APM', 'Missing "requests" package.\npip install requests')
         sys.exit(1)
 
     app = APMApp()
