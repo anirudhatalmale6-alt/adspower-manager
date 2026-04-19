@@ -101,7 +101,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.7"
+VERSION = "2.8"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -298,22 +298,37 @@ def get_adspower_userid_from_cmdline(cmdline):
 
 def force_foreground(hwnd):
     """Force a window to foreground - mimics AutoIt WinActivate.
-    Uses AttachThreadInput trick to bypass Windows foreground lock."""
+    Uses multiple tricks to bypass Windows foreground lock."""
     if not HAS_WIN32:
         return
     try:
+        # Trick 1: Simulate Alt key release - this allows SetForegroundWindow to work
+        # because Windows allows foreground changes during keyboard input
+        user32.keybd_event(0x12, 0, 2, 0)  # Alt key up (KEYEVENTF_KEYUP=2)
+
+        # Trick 2: Attach our thread to the FOREGROUND window's thread
+        # This gives our thread foreground privileges
         fore = user32.GetForegroundWindow()
-        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
-        cur_tid = kernel32.GetCurrentThreadId()
-        if target_tid != cur_tid:
-            user32.AttachThreadInput(cur_tid, target_tid, True)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
-        if target_tid != cur_tid:
-            user32.AttachThreadInput(cur_tid, target_tid, False)
+        if fore:
+            fore_tid = user32.GetWindowThreadProcessId(fore, None)
+            cur_tid = kernel32.GetCurrentThreadId()
+            attached = False
+            if fore_tid and fore_tid != cur_tid:
+                attached = bool(user32.AttachThreadInput(cur_tid, fore_tid, True))
+
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+
+            if attached:
+                user32.AttachThreadInput(cur_tid, fore_tid, False)
+        else:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
     except Exception:
-        # Fallback
-        user32.SetForegroundWindow(hwnd)
+        try:
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
 
 
 def show_window(hwnd):
@@ -1325,32 +1340,53 @@ class APMApp:
         self.root.after(0, self._refresh_tree)
 
     def _refresh_tree(self):
-        """Update the treeview with current browser list."""
+        """Incremental tree update - matches AutoIt GETBROWSERS behavior.
+        Only adds new windows, removes closed ones, updates changed titles.
+        Never rebuilds from scratch (prevents navigation jumping)."""
         self._refreshing_tree = True
         try:
-            # Remember selection
-            sel_items = self.tree.selection()
-            sel_hwnds = set()
-            for item in sel_items:
+            # Build lookup of current scan results by HWND
+            scan_hwnds = {}  # hwnd_str -> (profile, tab)
+            for hwnd, title, profile, tab in self.browsers:
+                scan_hwnds[str(hwnd)] = (profile, tab)
+
+            needs_sort = False
+
+            # 1. Update existing items / remove closed windows
+            for item in list(self.tree.get_children()):
                 vals = self.tree.item(item, 'values')
-                if vals and len(vals) > 2:
-                    sel_hwnds.add(vals[2])
+                if not vals or len(vals) < 3:
+                    self.tree.delete(item)
+                    continue
+                hwnd_str = vals[2]
+                if hwnd_str not in scan_hwnds:
+                    # Window closed - remove from tree
+                    self.tree.delete(item)
+                    needs_sort = True
+                else:
+                    # Window still open - update profile/tab if changed
+                    new_profile, new_tab = scan_hwnds[hwnd_str]
+                    old_profile, old_tab = vals[0], vals[1]
+                    if new_profile != old_profile or new_tab != old_tab:
+                        self.tree.item(item, values=(new_profile, new_tab, hwnd_str))
+                        needs_sort = True
+                    # Mark as processed
+                    del scan_hwnds[hwnd_str]
 
-            self.tree.delete(*self.tree.get_children())
+            # 2. Add new windows (those not already in tree)
+            for hwnd_str, (profile, tab) in scan_hwnds.items():
+                self.tree.insert('', 'end', values=(profile, tab, hwnd_str))
+                needs_sort = True
 
-            count = len(self.browsers)
+            # 3. Update count in heading
+            count = len(self.tree.get_children())
             self.tree.heading('profile', text=f'Profile ({count})')
 
-            for hwnd, title, profile, tab in self.browsers:
-                item = self.tree.insert('', 'end', values=(profile, tab, str(hwnd)))
-                if str(hwnd) in sel_hwnds:
-                    self.tree.selection_add(item)
-
-            # Auto-sort if enabled
-            if self.opt_autosorting.get():
+            # 4. Sort only when something changed
+            if needs_sort and self.opt_autosorting.get():
                 self._sort_tree(self.sort_by)
 
-            # Update current_pos to match selected item's new position
+            # 5. Update current_pos to match selected item's position
             sel = self.tree.selection()
             if sel:
                 items = self.tree.get_children()
