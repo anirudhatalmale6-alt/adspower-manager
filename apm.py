@@ -81,6 +81,13 @@ try:
     kernel32.GlobalLock.restype = ctypes.c_void_p
     kernel32.GlobalUnlock.argtypes = [HANDLE]
     kernel32.GlobalUnlock.restype = BOOL
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = DWORD
+
+    user32.AttachThreadInput.argtypes = [DWORD, DWORD, BOOL]
+    user32.AttachThreadInput.restype = BOOL
+    user32.BringWindowToTop.argtypes = [HWND]
+    user32.BringWindowToTop.restype = BOOL
 
     HAS_WIN32 = True
 except Exception:
@@ -94,7 +101,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.6"
+VERSION = "2.7"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -289,17 +296,37 @@ def get_adspower_userid_from_cmdline(cmdline):
     return ''
 
 
+def force_foreground(hwnd):
+    """Force a window to foreground - mimics AutoIt WinActivate.
+    Uses AttachThreadInput trick to bypass Windows foreground lock."""
+    if not HAS_WIN32:
+        return
+    try:
+        fore = user32.GetForegroundWindow()
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        cur_tid = kernel32.GetCurrentThreadId()
+        if target_tid != cur_tid:
+            user32.AttachThreadInput(cur_tid, target_tid, True)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        if target_tid != cur_tid:
+            user32.AttachThreadInput(cur_tid, target_tid, False)
+    except Exception:
+        # Fallback
+        user32.SetForegroundWindow(hwnd)
+
+
 def show_window(hwnd):
     """Show and maximize a window (used for profile select/navigate)."""
     if HAS_WIN32:
         user32.ShowWindow(hwnd, SW_MAXIMIZE)
-        user32.SetForegroundWindow(hwnd)
+        force_foreground(hwnd)
 
 
 def activate_window(hwnd):
     """Activate/bring to front without maximizing (used for URL sending, groups)."""
     if HAS_WIN32:
-        user32.SetForegroundWindow(hwnd)
+        force_foreground(hwnd)
 
 
 def minimize_window(hwnd):
@@ -317,7 +344,7 @@ def restore_and_resize(hwnd, w, h):
     if HAS_WIN32:
         user32.ShowWindow(hwnd, SW_RESTORE)
         user32.SetWindowPos(hwnd, None, 0, 0, w, h, 0x0040)  # SWP_SHOWWINDOW
-        user32.SetForegroundWindow(hwnd)
+        force_foreground(hwnd)
 
 
 def set_window_pos(hwnd, x, y, w, h):
@@ -436,9 +463,14 @@ class AdsPowerAPI:
             if len(users) < 100:
                 break
 
-        self._cache = all_users
-        self._cache_time = now
-        return all_users
+        # Don't wipe cache if API returned nothing (API might be temporarily down)
+        if all_users:
+            self._cache = all_users
+            self._cache_time = now
+        elif not self._cache:
+            self._cache = []
+            self._cache_time = now
+        return self._cache if self._cache else []
 
     def get_user_by_id(self, user_id):
         """Get a single profile by user_id."""
@@ -714,6 +746,7 @@ class APMApp:
         self.hotkeys_on = True
         self.extra_hotkeys_on = False
         self.pid_profile_cache = {}  # pid -> profile_name
+        self.uid_map = {}  # user_id -> custom_number (permanent, like AutoIt $GUIDMAP)
         self.sunpid_cache = {}  # pid -> bool
         self.cmdline_cache = {}  # pid -> cmdline
         self.cmdline_cache_time = 0
@@ -1212,6 +1245,10 @@ class APMApp:
             self.cmdline_cache.clear()
             self.cmdline_cache_time = now
 
+        # Budget for API calls per cycle (matches AutoIt $GRESOLVEBUDGET)
+        resolve_budget = 3
+        new_budget = 10  # Max new profiles per cycle
+
         for hwnd, title in chrome_windows:
             pid = get_window_pid(hwnd)
             if not pid:
@@ -1230,23 +1267,53 @@ class APMApp:
             # Resolve profile name
             if pid in self.pid_profile_cache:
                 profile_name = self.pid_profile_cache[pid]
+
+                # RETRY: if profile name looks like a raw user_id (6-12 lowercase alnum),
+                # retry resolution on each cycle with budget (matches AutoIt retry logic)
+                if (re.match(r'^[a-z0-9]{6,12}$', profile_name)
+                        and resolve_budget > 0):
+                    # Check uid_map first (instant, no budget needed)
+                    if profile_name in self.uid_map:
+                        old = profile_name
+                        profile_name = self.uid_map[profile_name]
+                        self.pid_profile_cache[pid] = profile_name
+                        self._log(f'Retry resolved (map): {old} -> {profile_name}')
+                    else:
+                        resolve_budget -= 1
+                        new_name = self.api.resolve_profile_name(profile_name)
+                        if new_name and new_name != profile_name:
+                            self.uid_map[profile_name] = new_name
+                            self.pid_profile_cache[pid] = new_name
+                            profile_name = new_name
+                            self._log(f'Retry resolved (API): {profile_name}')
             else:
+                if new_budget <= 0:
+                    continue
+                new_budget -= 1
+
                 if pid not in self.cmdline_cache:
                     self.cmdline_cache[pid] = get_process_cmdline(pid)
                 cmdline = self.cmdline_cache[pid]
                 user_id = get_adspower_userid_from_cmdline(cmdline)
                 if user_id:
-                    profile_name = self.api.resolve_profile_name(user_id)
-                    if profile_name == user_id:
-                        self._log(f'Profile NOT resolved (API may be offline): uid={user_id}')
+                    # Check uid_map first (instant lookup like AutoIt $GUIDMAP)
+                    if user_id in self.uid_map:
+                        profile_name = self.uid_map[user_id]
+                        self._log(f'Profile from map: uid={user_id} -> {profile_name}')
                     else:
-                        self._log(f'Profile resolved: uid={user_id} -> {profile_name}')
+                        profile_name = self.api.resolve_profile_name(user_id)
+                        if profile_name != user_id:
+                            self.uid_map[user_id] = profile_name
+                            self._log(f'Profile resolved: uid={user_id} -> {profile_name}')
+                        else:
+                            # Show user_id for now, will retry on next cycles
+                            self._log(f'Profile pending: uid={user_id} (will retry)')
                 else:
                     # Fallback: session name from cmdline
                     m = re.search(r'--session[_-]name="?([^"\s]+)"?', cmdline)
-                    profile_name = m.group(1) if m else user_id if user_id else f'PID:{pid}'
+                    profile_name = m.group(1) if m else f'PID:{pid}'
                     if self._scan_log_count <= 5:
-                        self._log(f'PID {pid}: no user_id from cmdline, using {profile_name}')
+                        self._log(f'PID {pid}: no user_id, using {profile_name}')
                 self.pid_profile_cache[pid] = profile_name
 
             # Tab title
@@ -1412,7 +1479,7 @@ class APMApp:
             if x < 0 or y < 0:
                 x, y = 100, 100
             user32.SetWindowPos(hwnd, None, x, y, w, h, 0x0040)
-            user32.SetForegroundWindow(hwnd)
+            force_foreground(hwnd)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
