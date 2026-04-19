@@ -94,7 +94,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.5"
+VERSION = "2.6"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -175,11 +175,11 @@ def save_config(cfg):
 # ─── Win32 Browser Management ────────────────────────────────────────────────
 
 def enum_windows():
-    """Get all visible windows with Chrome_WidgetWin_1 class."""
+    """Get all visible windows with Chrome_WidgetWin_1 class.
+    Filters out tiny popup/extension windows (< 200x200)."""
     if not HAS_WIN32:
         return []
     results = []
-    # CRITICAL: Use pointer-sized types for HWND and LPARAM on 64-bit Windows
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
     def callback(hwnd, _):
         try:
@@ -188,6 +188,13 @@ def enum_windows():
             class_name = ctypes.create_unicode_buffer(256)
             user32.GetClassNameW(hwnd, class_name, 256)
             if class_name.value == CHROME_CLASS:
+                # Filter out tiny popup/extension windows
+                rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w < 200 or h < 200:
+                    return True
                 title = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, title, 512)
                 if title.value:
@@ -1199,11 +1206,10 @@ class APMApp:
         if self._scan_log_count <= 3 or self._scan_log_count % 20 == 0:
             self._log(f'Scan: {len(chrome_windows)} Chrome windows found')
 
-        # Batch refresh caches every 30s so profile names get re-resolved
+        # Refresh cmdline cache every 30s (profile cache stays permanent like AutoIt)
         now = time.time()
         if now - self.cmdline_cache_time > 30:
             self.cmdline_cache.clear()
-            self.pid_profile_cache.clear()
             self.cmdline_cache_time = now
 
         for hwnd, title in chrome_windows:
@@ -1276,6 +1282,15 @@ class APMApp:
             # Auto-sort if enabled
             if self.opt_autosorting.get():
                 self._sort_tree(self.sort_by)
+
+            # Update current_pos to match selected item's new position
+            sel = self.tree.selection()
+            if sel:
+                items = self.tree.get_children()
+                for i, item in enumerate(items):
+                    if item == sel[0]:
+                        self.current_pos = i
+                        break
         finally:
             self._refreshing_tree = False
 
@@ -1285,18 +1300,24 @@ class APMApp:
         if hasattr(self, '_last_sort_time') and (now - self._last_sort_time) < 0.3:
             return
         self._last_sort_time = now
-        self.sort_by = col
-        items = [(self.tree.set(k, ('profile', 'tab')[col]), k) for k in self.tree.get_children()]
-        items.sort(key=lambda x: x[0].lower())
-        for i, (_, k) in enumerate(items):
-            self.tree.move(k, '', i)
+        self._sorting_in_progress = True
+        try:
+            self.sort_by = col
+            items = [(self.tree.set(k, ('profile', 'tab')[col]), k) for k in self.tree.get_children()]
+            items.sort(key=lambda x: x[0].lower())
+            for i, (_, k) in enumerate(items):
+                self.tree.move(k, '', i)
+        finally:
+            self._sorting_in_progress = False
 
     def _on_select(self, event):
-        """Track current position only. Don't activate windows here -
-        TreeviewSelect fires on refresh/sort too, not just user clicks."""
+        """Show selected browser window on user click.
+        Guards: skip during refresh, sort, or browser_move (those are programmatic)."""
         if self.browser_move_in_progress:
             return
         if getattr(self, '_refreshing_tree', False):
+            return
+        if getattr(self, '_sorting_in_progress', False):
             return
         sel = self.tree.selection()
         if sel:
@@ -1305,6 +1326,27 @@ class APMApp:
                 if item == sel[0]:
                     self.current_pos = i
                     break
+            # Show the selected window (matches AutoIt click behavior)
+            vals = self.tree.item(sel[0], 'values')
+            if vals and len(vals) > 2:
+                try:
+                    hwnd = int(vals[2])
+                    if self.opt_minimize_others.get():
+                        for other_item in items:
+                            if other_item != sel[0]:
+                                other_vals = self.tree.item(other_item, 'values')
+                                if other_vals and len(other_vals) > 2:
+                                    try:
+                                        minimize_window(int(other_vals[2]))
+                                    except Exception:
+                                        pass
+                    if self.opt_custom_nav.get():
+                        # On click: keep current position, just resize (like AutoIt)
+                        self._show_custom_size_keep_pos(hwnd)
+                    else:
+                        show_window(hwnd)
+                except (ValueError, TypeError):
+                    pass
 
     def _get_selected_hwnds(self):
         """Get HWNDs of selected items."""
@@ -1331,7 +1373,7 @@ class APMApp:
         return hwnds
 
     def _show_custom_size(self, hwnd):
-        """Restore + resize to custom nav dimensions (matches AutoIt BROWSERMOVE)."""
+        """Restore + resize to custom nav dimensions at x=0 (for forward/backward)."""
         try:
             w = int(self.set_navw.get())
         except (ValueError, AttributeError):
@@ -1345,6 +1387,32 @@ class APMApp:
         if h < 50:
             h = 540
         restore_and_resize(hwnd, w, h)
+
+    def _show_custom_size_keep_pos(self, hwnd):
+        """Restore + resize but keep window at its current position (for click activation).
+        Matches AutoIt: on click, window stays where it is, just resized."""
+        try:
+            w = int(self.set_navw.get())
+        except (ValueError, AttributeError):
+            w = 480
+        try:
+            h = int(self.set_navh.get())
+        except (ValueError, AttributeError):
+            h = 540
+        if w < 50:
+            w = 480
+        if h < 50:
+            h = 540
+        if HAS_WIN32:
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            # Get current position, keep it
+            rect = ctypes.wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            x, y = rect.left, rect.top
+            if x < 0 or y < 0:
+                x, y = 100, 100
+            user32.SetWindowPos(hwnd, None, x, y, w, h, 0x0040)
+            user32.SetForegroundWindow(hwnd)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -1364,6 +1432,14 @@ class APMApp:
         self.browser_move_in_progress = True
         try:
             count = len(items)
+            # Read current selection first (matches AutoIt BROWSERMOVE)
+            sel = self.tree.selection()
+            if sel:
+                for i, it in enumerate(items):
+                    if it == sel[0]:
+                        self.current_pos = i
+                        break
+
             if direction == 'fwd':
                 self.current_pos = (self.current_pos + 1) % count
             elif direction == 'bck':
