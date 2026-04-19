@@ -94,7 +94,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.2"
+VERSION = "2.3"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -153,6 +153,7 @@ def load_config():
             'ProfileName': '', 'ScreenshotFolder': os.path.join(BASE_DIR, 'Screenshots'),
             'SheetUrl': '',
         },
+        'ADSPOWER': {'ApiKey': ''},
         'DISTRIBTE': {'Email': '', 'Password': ''},
         'POSITIONER': {
             'Cols': '4', 'Rows': '2', 'Width': '480', 'Height': '540',
@@ -303,6 +304,18 @@ def close_window(hwnd):
         user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
 
 
+def restore_and_resize(hwnd, w, h):
+    """Restore window (un-maximize) and resize to w x h, keeping current position."""
+    if HAS_WIN32:
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        rect = ctypes.wintypes.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            user32.SetWindowPos(hwnd, None, rect.left, rect.top, w, h, 0x0040)  # SWP_SHOWWINDOW
+        else:
+            user32.SetWindowPos(hwnd, None, 100, 100, w, h, 0x0040)
+        user32.SetForegroundWindow(hwnd)
+
+
 def set_window_pos(hwnd, x, y, w, h):
     if HAS_WIN32:
         user32.ShowWindow(hwnd, SW_RESTORE)
@@ -377,22 +390,32 @@ def get_screen_size():
 # ─── AdsPower API ─────────────────────────────────────────────────────────────
 
 class AdsPowerAPI:
-    def __init__(self, port=50325):
+    def __init__(self, port=50325, api_key=''):
         self.bases = [f'http://127.0.0.1:{port}', f'http://local.adspower.net:{port}']
+        self.api_key = api_key
         self._cache = None
         self._cache_time = 0
         self._cache_ttl = 30  # seconds
 
-    def get_user_list(self, force=False):
-        """Get all profiles from AdsPower user/list API."""
+    def _api_path(self, path):
+        """Append api_key to path if configured."""
+        if self.api_key:
+            sep = '&' if '?' in path else '?'
+            return f'{path}{sep}api_key={self.api_key}'
+        return path
+
+    def get_user_list(self, force=False, max_pages=20):
+        """Get profiles from AdsPower user/list API.
+        Limited to max_pages to avoid stalling on large accounts (70K+ profiles).
+        Individual profiles are resolved via get_user_by_id as fallback."""
         now = time.time()
         if not force and self._cache and (now - self._cache_time) < self._cache_ttl:
             return self._cache
 
         all_users = []
         page = 1
-        while True:
-            data = self._get(f'/api/v1/user/list?page={page}&page_size=100')
+        while page <= max_pages:
+            data = self._get(self._api_path(f'/api/v1/user/list?page={page}&page_size=100'))
             if not data:
                 break
             raw = data.get('data', {})
@@ -415,7 +438,7 @@ class AdsPowerAPI:
 
     def get_user_by_id(self, user_id):
         """Get a single profile by user_id."""
-        data = self._get(f'/api/v1/user/list?user_id={user_id}')
+        data = self._get(self._api_path(f'/api/v1/user/list?user_id={user_id}'))
         if not data:
             return None
         raw = data.get('data', {})
@@ -633,7 +656,8 @@ class APMApp:
     def __init__(self):
         ensure_dirs()
         self.cfg = load_config()
-        self.api = AdsPowerAPI(50325)
+        api_key = self.cfg.get('ADSPOWER', 'ApiKey', fallback='')
+        self.api = AdsPowerAPI(50325, api_key=api_key)
         self.browsers = []  # [(hwnd, title, profile_name, tab_title), ...]
         self.current_pos = 0
         self.running = True
@@ -925,6 +949,18 @@ class APMApp:
         self.set_navh.pack(side='left', padx=2)
         row += 1
 
+        # AdsPower API Key
+        tk.Label(inner, text='AdsPower', font=('', 9, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(10, 2), padx=8)
+        row += 1
+        ak_frame = tk.Frame(inner)
+        ak_frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=12)
+        tk.Label(ak_frame, text='API Key:', font=('', 8)).pack(side='left')
+        self.set_apikey = tk.Entry(ak_frame, width=30, font=('', 8))
+        self.set_apikey.insert(0, self.cfg.get('ADSPOWER', 'ApiKey', fallback=''))
+        self.set_apikey.pack(side='left', padx=4)
+        row += 1
+
         tk.Button(inner, text='Save Settings', command=self._save_settings).grid(
             row=row, column=0, columnspan=2, pady=10)
 
@@ -953,8 +989,10 @@ class APMApp:
 
         btn_frame2 = tk.Frame(f)
         btn_frame2.grid(row=row, column=0, columnspan=2, pady=2)
+        tk.Button(btn_frame2, text='QUE Screenshot', command=lambda: self._discord_screenshot('que')).pack(side='left', padx=2)
         tk.Button(btn_frame2, text='PROD Screenshot', command=lambda: self._discord_screenshot('prod')).pack(side='left', padx=2)
-        tk.Button(btn_frame2, text='Screenshot Only', command=self._save_screenshot).pack(side='left', padx=2)
+        tk.Button(btn_frame2, text='VF Screenshot', command=lambda: self._discord_screenshot('vf')).pack(side='left', padx=2)
+        tk.Button(btn_frame2, text='Save Only', command=self._save_screenshot).pack(side='left', padx=2)
         row += 1
 
         self.dc_status = tk.Label(f, text='', fg='green')
@@ -1204,6 +1242,8 @@ class APMApp:
     def _on_select(self, event):
         if self.browser_move_in_progress:
             return
+        if getattr(self, '_sorting_in_progress', False):
+            return
         sel = self.tree.selection()
         if sel:
             items = self.tree.get_children()
@@ -1211,6 +1251,28 @@ class APMApp:
                 if item == sel[0]:
                     self.current_pos = i
                     break
+            # Show/activate the selected window (matches original AutoIt click behavior)
+            vals = self.tree.item(sel[0], 'values')
+            if vals and len(vals) > 2:
+                try:
+                    hwnd = int(vals[2])
+                    # Minimize others if enabled
+                    if self.opt_minimize_others.get():
+                        for other_item in items:
+                            if other_item != sel[0]:
+                                ov = self.tree.item(other_item, 'values')
+                                if ov and len(ov) > 2:
+                                    try:
+                                        minimize_window(int(ov[2]))
+                                    except Exception:
+                                        pass
+                    # Custom nav size or maximize
+                    if self.opt_custom_nav.get():
+                        self._show_custom_size(hwnd)
+                    else:
+                        show_window(hwnd)
+                except (ValueError, TypeError):
+                    pass
 
     def _get_selected_hwnds(self):
         """Get HWNDs of selected items."""
@@ -1235,6 +1297,22 @@ class APMApp:
                 except (ValueError, TypeError):
                     pass
         return hwnds
+
+    def _show_custom_size(self, hwnd):
+        """Restore + resize to custom nav dimensions (matches AutoIt BROWSERMOVE)."""
+        try:
+            w = int(self.set_navw.get())
+        except (ValueError, AttributeError):
+            w = 480
+        try:
+            h = int(self.set_navh.get())
+        except (ValueError, AttributeError):
+            h = 540
+        if w < 50:
+            w = 480
+        if h < 50:
+            h = 540
+        restore_and_resize(hwnd, w, h)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -1280,8 +1358,12 @@ class APMApp:
                                 except Exception:
                                     pass
 
-                # Always maximize (matches original AutoIt behavior)
-                show_window(hwnd)
+                # Custom nav size: restore + resize (keep position)
+                # No custom nav: maximize (SW_MAXIMIZE)
+                if self.opt_custom_nav.get():
+                    self._show_custom_size(hwnd)
+                else:
+                    show_window(hwnd)
         finally:
             self.browser_move_in_progress = False
 
@@ -1306,7 +1388,10 @@ class APMApp:
                     if not is_window_visible(hwnd):
                         continue
                     if action == 'show':
-                        show_window(hwnd)
+                        if self.opt_custom_nav.get():
+                            self._show_custom_size(hwnd)
+                        else:
+                            show_window(hwnd)
                     elif action == 'minimize':
                         minimize_window(hwnd)
                     elif action == 'close':
@@ -1600,16 +1685,34 @@ class APMApp:
         webhook = {
             'prod': self.dc_prodwebhook.get(),
             'que': self.dc_quewebhook.get(),
+            'vf': getattr(self, 'dc_vfwebhook', None) and self.dc_vfwebhook.get() or '',
         }.get(channel, '')
 
+        if not webhook:
+            self.dc_status.configure(text=f'Error: No webhook URL set for {channel}', fg='red')
+            return
+
         profile = self.dc_profile.get().strip() or 'APM'
+        message = self.dc_message.get('1.0', 'end').strip()
+
+        if not self.browsers:
+            self.dc_status.configure(text='Error: No profiles in list', fg='red')
+            return
+
+        self.dc_status.configure(text=f'Preparing {len(self.browsers)} profiles...', fg='blue')
 
         def do_send():
             img_bytes = generate_profile_image(self.browsers)
             if not img_bytes:
                 self.root.after(0, lambda: self.dc_status.configure(text='Failed to generate image', fg='red'))
                 return
-            url = discord_webhook_upload_image(webhook, img_bytes, username=profile)
+            self.root.after(0, lambda: self.dc_status.configure(
+                text=f'Sending to Discord {channel}...', fg='blue'))
+            url = discord_webhook_upload_image(webhook, img_bytes, content=message, username=profile)
+            if not url:
+                self.root.after(0, lambda: self.dc_status.configure(
+                    text='Error: Upload failed (check webhook URL)', fg='red'))
+                return
 
             # Log to sheets
             sheet_url = self.dc_sheeturl.get().strip()
@@ -1687,6 +1790,10 @@ class APMApp:
         self.cfg.set('MAIN', 'CustomNavSize', '1' if self.opt_custom_nav.get() else '0')
         self.cfg.set('MAIN', 'NavWidth', self.set_navw.get())
         self.cfg.set('MAIN', 'NavHeight', self.set_navh.get())
+        # AdsPower API key
+        new_key = self.set_apikey.get().strip()
+        self.cfg.set('ADSPOWER', 'ApiKey', new_key)
+        self.api.api_key = new_key
         save_config(self.cfg)
         # Re-register hotkeys
         self._unregister_hotkeys()
