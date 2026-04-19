@@ -94,7 +94,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.3"
+VERSION = "2.4"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -305,14 +305,10 @@ def close_window(hwnd):
 
 
 def restore_and_resize(hwnd, w, h):
-    """Restore window (un-maximize) and resize to w x h, keeping current position."""
+    """Restore window (un-maximize) and resize to w x h, positioned at left side (0,0)."""
     if HAS_WIN32:
         user32.ShowWindow(hwnd, SW_RESTORE)
-        rect = ctypes.wintypes.RECT()
-        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            user32.SetWindowPos(hwnd, None, rect.left, rect.top, w, h, 0x0040)  # SWP_SHOWWINDOW
-        else:
-            user32.SetWindowPos(hwnd, None, 100, 100, w, h, 0x0040)
+        user32.SetWindowPos(hwnd, None, 0, 0, w, h, 0x0040)  # SWP_SHOWWINDOW
         user32.SetForegroundWindow(hwnd)
 
 
@@ -441,6 +437,8 @@ class AdsPowerAPI:
         data = self._get(self._api_path(f'/api/v1/user/list?user_id={user_id}'))
         if not data:
             return None
+        if data.get('code') != 0:
+            return None
         raw = data.get('data', {})
         if isinstance(raw, dict):
             lst = raw.get('list', [])
@@ -487,17 +485,20 @@ class AdsPowerAPI:
                     return val
             return ''
 
-        # First check cache
+        # First check cache (limited pages for performance)
         users = self.get_user_list()
-        for u in (users or []):
-            uid = str(u.get('user_id') or u.get('userId') or u.get('id') or '')
-            if uid == user_id:
-                name = _extract_name(u)
-                return name if name else user_id
-        # Direct fetch
+        if users:
+            for u in users:
+                uid = str(u.get('user_id') or u.get('userId') or u.get('id') or '')
+                if uid == user_id:
+                    name = _extract_name(u)
+                    return name if name else user_id
+        # Direct fetch by user_id (fast, single API call)
         u = self.get_user_by_id(user_id)
-        name = _extract_name(u)
-        return name if name else user_id
+        if u:
+            name = _extract_name(u)
+            return name if name else user_id
+        return user_id
 
 
 # ─── Distribte Extension ─────────────────────────────────────────────────────
@@ -562,20 +563,57 @@ def discord_webhook_send_text(webhook_url, content, username='APM'):
 def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles.png',
                                   content='', username='APM'):
     """Upload an image to Discord via webhook multipart."""
-    if not webhook_url or not requests:
+    if not webhook_url:
         return None
+
+    # Use requests if available, otherwise fall back to urllib multipart
+    if requests:
+        try:
+            files = {'file': (filename, image_bytes, 'image/png')}
+            data = {'username': username}
+            if content:
+                data['content'] = content
+            r = requests.post(webhook_url + '?wait=true', data=data, files=files, timeout=15)
+            if r.ok:
+                resp = r.json()
+                attachments = resp.get('attachments', [])
+                if attachments:
+                    return attachments[0].get('url', '')
+            return None
+        except Exception:
+            pass
+
+    # Fallback: manual multipart with urllib (no requests needed)
     try:
-        files = {'file': (filename, image_bytes, 'image/png')}
-        data = {'content': content, 'username': username}
-        r = requests.post(webhook_url + '?wait=true', data=data, files=files, timeout=15)
-        if r.ok:
-            resp = r.json()
-            attachments = resp.get('attachments', [])
-            if attachments:
-                return attachments[0].get('url', '')
-        return None
+        import uuid
+        boundary = uuid.uuid4().hex
+        body = b''
+        # Username field
+        body += f'--{boundary}\r\n'.encode()
+        body += b'Content-Disposition: form-data; name="username"\r\n\r\n'
+        body += username.encode() + b'\r\n'
+        # Content field
+        if content:
+            body += f'--{boundary}\r\n'.encode()
+            body += b'Content-Disposition: form-data; name="content"\r\n\r\n'
+            body += content.encode() + b'\r\n'
+        # File field
+        body += f'--{boundary}\r\n'.encode()
+        body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+        body += b'Content-Type: image/png\r\n\r\n'
+        body += image_bytes + b'\r\n'
+        body += f'--{boundary}--\r\n'.encode()
+
+        req = Request(webhook_url + '?wait=true', data=body)
+        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+        resp = urlopen(req, timeout=15)
+        resp_data = json.loads(resp.read().decode('utf-8'))
+        attachments = resp_data.get('attachments', [])
+        if attachments:
+            return attachments[0].get('url', '')
     except Exception:
-        return None
+        pass
+    return None
 
 
 def log_to_google_sheets(sheet_url, sheet_name, rows):
@@ -1191,7 +1229,10 @@ class APMApp:
                 user_id = get_adspower_userid_from_cmdline(cmdline)
                 if user_id:
                     profile_name = self.api.resolve_profile_name(user_id)
-                    self._log(f'Profile resolved: uid={user_id} -> {profile_name}')
+                    if profile_name == user_id:
+                        self._log(f'Profile NOT resolved (API may be offline): uid={user_id}')
+                    else:
+                        self._log(f'Profile resolved: uid={user_id} -> {profile_name}')
                 else:
                     # Fallback: session name from cmdline
                     m = re.search(r'--session[_-]name="?([^"\s]+)"?', cmdline)
@@ -1702,16 +1743,27 @@ class APMApp:
         self.dc_status.configure(text=f'Preparing {len(self.browsers)} profiles...', fg='blue')
 
         def do_send():
-            img_bytes = generate_profile_image(self.browsers)
+            try:
+                img_bytes = generate_profile_image(self.browsers)
+            except Exception as e:
+                self.root.after(0, lambda: self.dc_status.configure(
+                    text=f'Image error: {e}', fg='red'))
+                return
             if not img_bytes:
-                self.root.after(0, lambda: self.dc_status.configure(text='Failed to generate image', fg='red'))
+                self.root.after(0, lambda: self.dc_status.configure(
+                    text='Failed to generate image (PIL missing?)', fg='red'))
                 return
             self.root.after(0, lambda: self.dc_status.configure(
-                text=f'Sending to Discord {channel}...', fg='blue'))
-            url = discord_webhook_upload_image(webhook, img_bytes, content=message, username=profile)
+                text=f'Uploading {len(img_bytes)} bytes to Discord {channel}...', fg='blue'))
+            try:
+                url = discord_webhook_upload_image(webhook, img_bytes, content=message, username=profile)
+            except Exception as e:
+                self.root.after(0, lambda: self.dc_status.configure(
+                    text=f'Upload error: {e}', fg='red'))
+                return
             if not url:
                 self.root.after(0, lambda: self.dc_status.configure(
-                    text='Error: Upload failed (check webhook URL)', fg='red'))
+                    text='Upload failed (check webhook URL)', fg='red'))
                 return
 
             # Log to sheets
