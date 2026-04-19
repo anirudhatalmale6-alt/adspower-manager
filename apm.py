@@ -94,7 +94,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.4"
+VERSION = "2.5"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -271,7 +271,8 @@ def get_adspower_userid_from_cmdline(cmdline):
     Matches AutoIt regex: user-data-dir="?[^"]*[/\\]([a-z0-9]+)[/\\]?"?
     The user_id is the last path segment (e.g. k1blafdl_h26ptei)."""
     # AutoIt pattern: last folder segment of user-data-dir path
-    m = re.search(r'user-data-dir="?[^"]*[/\\]([a-z0-9_]+)[/\\]?"?', cmdline, re.IGNORECASE)
+    # IMPORTANT: [a-z0-9] without underscore - matches AutoIt original exactly
+    m = re.search(r'user-data-dir="?[^"]*[/\\]([a-z0-9]+)[/\\]?"?', cmdline, re.IGNORECASE)
     if m:
         return m.group(1)
     # Also try --session_name
@@ -1198,10 +1199,11 @@ class APMApp:
         if self._scan_log_count <= 3 or self._scan_log_count % 20 == 0:
             self._log(f'Scan: {len(chrome_windows)} Chrome windows found')
 
-        # Batch refresh cmdline cache every 30s
+        # Batch refresh caches every 30s so profile names get re-resolved
         now = time.time()
         if now - self.cmdline_cache_time > 30:
             self.cmdline_cache.clear()
+            self.pid_profile_cache.clear()
             self.cmdline_cache_time = now
 
         for hwnd, title in chrome_windows:
@@ -1251,29 +1253,38 @@ class APMApp:
 
     def _refresh_tree(self):
         """Update the treeview with current browser list."""
-        # Remember selection
-        sel_items = self.tree.selection()
-        sel_hwnds = set()
-        for item in sel_items:
-            vals = self.tree.item(item, 'values')
-            if vals and len(vals) > 2:
-                sel_hwnds.add(vals[2])
+        self._refreshing_tree = True
+        try:
+            # Remember selection
+            sel_items = self.tree.selection()
+            sel_hwnds = set()
+            for item in sel_items:
+                vals = self.tree.item(item, 'values')
+                if vals and len(vals) > 2:
+                    sel_hwnds.add(vals[2])
 
-        self.tree.delete(*self.tree.get_children())
+            self.tree.delete(*self.tree.get_children())
 
-        count = len(self.browsers)
-        self.tree.heading('profile', text=f'Profile ({count})')
+            count = len(self.browsers)
+            self.tree.heading('profile', text=f'Profile ({count})')
 
-        for hwnd, title, profile, tab in self.browsers:
-            item = self.tree.insert('', 'end', values=(profile, tab, str(hwnd)))
-            if str(hwnd) in sel_hwnds:
-                self.tree.selection_add(item)
+            for hwnd, title, profile, tab in self.browsers:
+                item = self.tree.insert('', 'end', values=(profile, tab, str(hwnd)))
+                if str(hwnd) in sel_hwnds:
+                    self.tree.selection_add(item)
 
-        # Auto-sort if enabled
-        if self.opt_autosorting.get():
-            self._sort_tree(self.sort_by)
+            # Auto-sort if enabled
+            if self.opt_autosorting.get():
+                self._sort_tree(self.sort_by)
+        finally:
+            self._refreshing_tree = False
 
     def _sort_tree(self, col):
+        # Debounce: ignore rapid sort clicks (within 300ms)
+        now = time.time()
+        if hasattr(self, '_last_sort_time') and (now - self._last_sort_time) < 0.3:
+            return
+        self._last_sort_time = now
         self.sort_by = col
         items = [(self.tree.set(k, ('profile', 'tab')[col]), k) for k in self.tree.get_children()]
         items.sort(key=lambda x: x[0].lower())
@@ -1281,9 +1292,11 @@ class APMApp:
             self.tree.move(k, '', i)
 
     def _on_select(self, event):
+        """Track current position only. Don't activate windows here -
+        TreeviewSelect fires on refresh/sort too, not just user clicks."""
         if self.browser_move_in_progress:
             return
-        if getattr(self, '_sorting_in_progress', False):
+        if getattr(self, '_refreshing_tree', False):
             return
         sel = self.tree.selection()
         if sel:
@@ -1292,28 +1305,6 @@ class APMApp:
                 if item == sel[0]:
                     self.current_pos = i
                     break
-            # Show/activate the selected window (matches original AutoIt click behavior)
-            vals = self.tree.item(sel[0], 'values')
-            if vals and len(vals) > 2:
-                try:
-                    hwnd = int(vals[2])
-                    # Minimize others if enabled
-                    if self.opt_minimize_others.get():
-                        for other_item in items:
-                            if other_item != sel[0]:
-                                ov = self.tree.item(other_item, 'values')
-                                if ov and len(ov) > 2:
-                                    try:
-                                        minimize_window(int(ov[2]))
-                                    except Exception:
-                                        pass
-                    # Custom nav size or maximize
-                    if self.opt_custom_nav.get():
-                        self._show_custom_size(hwnd)
-                    else:
-                        show_window(hwnd)
-                except (ValueError, TypeError):
-                    pass
 
     def _get_selected_hwnds(self):
         """Get HWNDs of selected items."""
