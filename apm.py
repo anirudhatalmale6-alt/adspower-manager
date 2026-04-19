@@ -101,7 +101,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.8"
+VERSION = "2.9"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -617,41 +617,45 @@ def discord_webhook_send_text(webhook_url, content, username='APM'):
 
 def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles.png',
                                   content='', username='APM'):
-    """Upload an image to Discord via webhook multipart."""
+    """Upload an image to Discord via webhook multipart.
+    Uses payload_json format (Discord recommended for webhook file uploads)."""
     if not webhook_url:
         return None
 
-    # Use requests if available, otherwise fall back to urllib multipart
+    # Build payload_json (Discord's recommended format for webhooks with files)
+    payload = {'username': username}
+    if content:
+        payload['content'] = content
+
+    # Try requests first
     if requests:
         try:
-            files = {'file': (filename, image_bytes, 'image/png')}
-            data = {'username': username}
-            if content:
-                data['content'] = content
-            r = requests.post(webhook_url + '?wait=true', data=data, files=files, timeout=15)
+            files = {
+                'file': (filename, image_bytes, 'image/png'),
+                'payload_json': (None, json.dumps(payload), 'application/json'),
+            }
+            r = requests.post(webhook_url + '?wait=true', files=files, timeout=20)
             if r.ok:
                 resp = r.json()
                 attachments = resp.get('attachments', [])
                 if attachments:
                     return attachments[0].get('url', '')
+                return 'sent'  # Image sent even if no URL in response
+            # Log error for debugging
             return None
         except Exception:
             pass
 
-    # Fallback: manual multipart with urllib (no requests needed)
+    # Fallback: manual multipart with urllib
     try:
         import uuid
         boundary = uuid.uuid4().hex
         body = b''
-        # Username field
+        # payload_json field
         body += f'--{boundary}\r\n'.encode()
-        body += b'Content-Disposition: form-data; name="username"\r\n\r\n'
-        body += username.encode() + b'\r\n'
-        # Content field
-        if content:
-            body += f'--{boundary}\r\n'.encode()
-            body += b'Content-Disposition: form-data; name="content"\r\n\r\n'
-            body += content.encode() + b'\r\n'
+        body += b'Content-Disposition: form-data; name="payload_json"\r\n'
+        body += b'Content-Type: application/json\r\n\r\n'
+        body += json.dumps(payload).encode() + b'\r\n'
         # File field
         body += f'--{boundary}\r\n'.encode()
         body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
@@ -661,11 +665,12 @@ def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles.pn
 
         req = Request(webhook_url + '?wait=true', data=body)
         req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        resp = urlopen(req, timeout=15)
+        resp = urlopen(req, timeout=20)
         resp_data = json.loads(resp.read().decode('utf-8'))
         attachments = resp_data.get('attachments', [])
         if attachments:
             return attachments[0].get('url', '')
+        return 'sent'
     except Exception:
         pass
     return None
@@ -858,6 +863,10 @@ class APMApp:
         # Treeview (Profile | Tab | Handle)
         tree_frame = tk.Frame(content)
         tree_frame.pack(side='left', fill='both', expand=True)
+
+        # Use 'clam' theme for column separator lines in treeview
+        style = ttk.Style()
+        style.theme_use('clam')
 
         cols = ('profile', 'tab', 'handle')
         self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings', selectmode='extended')
