@@ -101,7 +101,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.1"
+VERSION = "3.2"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -618,7 +618,7 @@ def discord_webhook_send_text(webhook_url, content, username='APM'):
 def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.png',
                                   content='', username='APM'):
     """Upload an image to Discord via webhook.
-    Tries multiple approaches to ensure the image actually gets sent."""
+    Uses curl subprocess (most reliable, bypasses all Python HTTP issues)."""
     if not webhook_url:
         return None
 
@@ -628,70 +628,106 @@ def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.
     elif 'wait=' not in url:
         url += '&wait=true'
 
-    last_error = ''
+    errors = []
 
-    # Approach 1: Save to temp file, upload via requests (most reliable)
-    if requests:
+    # Save image to temp file first
+    import tempfile
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=os.path.dirname(sys.argv[0]) or '.') as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+    except Exception as e:
+        errors.append(f'temp file: {e}')
+        tmp_path = None
+
+    if tmp_path:
+        # Approach 1: curl (built into Windows 10+, most reliable)
         try:
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                tmp.write(image_bytes)
-                tmp_path = tmp.name
+            cmd = ['curl', '-s', '-X', 'POST',
+                   '-F', f'username={username}',
+                   '-F', f'content={content}',
+                   '-F', f'file0=@{tmp_path};type=image/png;filename={filename}',
+                   url]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout:
+                resp = json.loads(result.stdout)
+                atts = resp.get('attachments', [])
+                if atts:
+                    _cleanup_tmp(tmp_path)
+                    return atts[0].get('url', '')
+                if resp.get('id'):
+                    _cleanup_tmp(tmp_path)
+                    return 'sent'
+            errors.append(f'curl rc={result.returncode} stderr={result.stderr[:200]}')
+        except FileNotFoundError:
+            errors.append('curl not found')
+        except Exception as e:
+            errors.append(f'curl: {e}')
+
+        # Approach 2: requests with file handle
+        if requests:
             try:
                 with open(tmp_path, 'rb') as f:
-                    payload = {'username': username}
-                    if content:
-                        payload['content'] = content
                     r = requests.post(url,
-                        data=payload,
+                        data={'username': username, 'content': content},
                         files={'file': (filename, f, 'image/png')},
                         timeout=30)
                 if r.ok:
                     resp = r.json()
                     atts = resp.get('attachments', [])
-                    if atts:
-                        return atts[0].get('url', '')
-                    return 'sent'
-                else:
-                    last_error = f'HTTP {r.status_code}: {r.text[:200]}'
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                    _cleanup_tmp(tmp_path)
+                    return atts[0].get('url', '') if atts else 'sent'
+                errors.append(f'requests HTTP {r.status_code}: {r.text[:200]}')
+            except Exception as e:
+                errors.append(f'requests: {e}')
+
+        # Approach 3: urllib manual multipart
+        try:
+            import random
+            boundary = f'----Boundary{random.randint(100000, 999999)}'
+            parts = f'--{boundary}\r\nContent-Disposition: form-data; name="username"\r\n\r\n{username}\r\n'
+            parts += f'--{boundary}\r\nContent-Disposition: form-data; name="content"\r\n\r\n{content}\r\n'
+            file_hdr = f'--{boundary}\r\nContent-Disposition: form-data; name="file0"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n'
+            footer = f'\r\n--{boundary}--\r\n'
+            body = parts.encode('utf-8') + file_hdr.encode('utf-8') + image_bytes + footer.encode('utf-8')
+            req = Request(url, data=body)
+            req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            resp = urlopen(req, timeout=30, context=ctx)
+            resp_data = json.loads(resp.read().decode('utf-8'))
+            atts = resp_data.get('attachments', [])
+            _cleanup_tmp(tmp_path)
+            return atts[0].get('url', '') if atts else 'sent'
         except Exception as e:
-            last_error = str(e)
+            errors.append(f'urllib: {e}')
 
-    # Approach 2: Manual multipart via urllib (matching AutoIt format)
-    try:
-        import random
-        boundary = f'----AutoItBoundary{random.randint(100000, 999999)}'
-        parts = []
-        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="username"\r\n\r\n{username}\r\n')
-        if content:
-            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="content"\r\n\r\n{content}\r\n')
-        text_bytes = ''.join(parts).encode('utf-8')
-        file_hdr = f'--{boundary}\r\nContent-Disposition: form-data; name="file0"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n'.encode('utf-8')
-        footer = f'\r\n--{boundary}--\r\n'.encode('utf-8')
-        body = text_bytes + file_hdr + image_bytes + footer
-        req = Request(url, data=body)
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        resp = urlopen(req, timeout=30)
-        resp_data = json.loads(resp.read().decode('utf-8'))
-        atts = resp_data.get('attachments', [])
-        if atts:
-            return atts[0].get('url', '')
-        return 'sent'
-    except Exception as e:
-        last_error = f'{last_error}; urllib: {e}'
+        _cleanup_tmp(tmp_path)
 
-    # Log error for debugging
+    # Log all errors for debugging
     try:
-        with open(os.path.join(os.path.dirname(sys.argv[0]), 'discord_error.log'), 'w') as f:
-            f.write(f'Discord upload failed\nURL: {webhook_url[:50]}...\nImage size: {len(image_bytes)}\nError: {last_error}\n')
+        log_path = os.path.join(os.path.dirname(sys.argv[0]) or '.', 'discord_error.log')
+        with open(log_path, 'w') as f:
+            f.write(f'Discord upload failed at {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+            f.write(f'URL: {webhook_url[:60]}...\n')
+            f.write(f'Image size: {len(image_bytes)} bytes\n')
+            f.write(f'Tmp path: {tmp_path}\n')
+            for i, err in enumerate(errors):
+                f.write(f'Attempt {i+1}: {err}\n')
     except Exception:
         pass
     return None
+
+
+def _cleanup_tmp(path):
+    try:
+        if path:
+            os.unlink(path)
+    except Exception:
+        pass
 
 
 def log_to_google_sheets(sheet_url, sheet_name, rows):
