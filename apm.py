@@ -101,8 +101,8 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.0"
-WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
+VERSION = "3.1"
+WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
 # Win32 constants
@@ -617,72 +617,80 @@ def discord_webhook_send_text(webhook_url, content, username='APM'):
 
 def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.png',
                                   content='', username='APM'):
-    """Upload an image to Discord via webhook multipart.
-    Matches AutoIt _DISCORDWEBHOOKUPLOADMULTI format exactly:
-    - Separate username/content fields (not payload_json)
-    - File field named 'file0' (not 'file')
-    - Manual binary body construction."""
+    """Upload an image to Discord via webhook.
+    Tries multiple approaches to ensure the image actually gets sent."""
     if not webhook_url:
         return None
 
-    # Build multipart body matching AutoIt format exactly
-    import random
-    boundary = f'----PythonBoundary{random.randint(100000, 999999)}'
+    url = webhook_url
+    if '?' not in url:
+        url += '?wait=true'
+    elif 'wait=' not in url:
+        url += '&wait=true'
 
-    # Text parts (username + content) - matching AutoIt format
-    text_part = f'--{boundary}\r\n'
-    text_part += 'Content-Disposition: form-data; name="username"\r\n\r\n'
-    text_part += f'{username}\r\n'
-    text_part += f'--{boundary}\r\n'
-    text_part += 'Content-Disposition: form-data; name="content"\r\n\r\n'
-    text_part += f'{content}\r\n'
+    last_error = ''
 
-    # File header - matching AutoIt: name="file0", filename="profiles_1.png"
-    file_header = f'--{boundary}\r\n'
-    file_header += f'Content-Disposition: form-data; name="file0"; filename="{filename}"\r\n'
-    file_header += 'Content-Type: image/png\r\n\r\n'
-
-    footer = f'\r\n--{boundary}--\r\n'
-
-    # Assemble binary body
-    body = text_part.encode('utf-8') + file_header.encode('utf-8') + image_bytes + footer.encode('utf-8')
-
-    # Ensure ?wait=true
-    if '?' in webhook_url:
-        if 'wait=' not in webhook_url:
-            webhook_url += '&wait=true'
-    else:
-        webhook_url += '?wait=true'
-
-    # Send via urllib (raw binary, like AutoIt's WinHttp)
-    try:
-        req = Request(webhook_url, data=body, method='POST')
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        req.add_header('Content-Length', str(len(body)))
-        resp = urlopen(req, timeout=30)
-        resp_text = resp.read().decode('utf-8')
-        resp_data = json.loads(resp_text)
-        attachments = resp_data.get('attachments', [])
-        if attachments:
-            return attachments[0].get('url', '')
-        return 'sent'
-    except Exception as e:
-        pass
-
-    # Fallback: try with requests if urllib failed
+    # Approach 1: Save to temp file, upload via requests (most reliable)
     if requests:
         try:
-            r = requests.post(webhook_url, data=body,
-                            headers={'Content-Type': f'multipart/form-data; boundary={boundary}'},
-                            timeout=30)
-            if r.ok:
-                resp = r.json()
-                attachments = resp.get('attachments', [])
-                if attachments:
-                    return attachments[0].get('url', '')
-                return 'sent'
-        except Exception:
-            pass
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp.write(image_bytes)
+                tmp_path = tmp.name
+            try:
+                with open(tmp_path, 'rb') as f:
+                    payload = {'username': username}
+                    if content:
+                        payload['content'] = content
+                    r = requests.post(url,
+                        data=payload,
+                        files={'file': (filename, f, 'image/png')},
+                        timeout=30)
+                if r.ok:
+                    resp = r.json()
+                    atts = resp.get('attachments', [])
+                    if atts:
+                        return atts[0].get('url', '')
+                    return 'sent'
+                else:
+                    last_error = f'HTTP {r.status_code}: {r.text[:200]}'
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            last_error = str(e)
+
+    # Approach 2: Manual multipart via urllib (matching AutoIt format)
+    try:
+        import random
+        boundary = f'----AutoItBoundary{random.randint(100000, 999999)}'
+        parts = []
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="username"\r\n\r\n{username}\r\n')
+        if content:
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="content"\r\n\r\n{content}\r\n')
+        text_bytes = ''.join(parts).encode('utf-8')
+        file_hdr = f'--{boundary}\r\nContent-Disposition: form-data; name="file0"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n'.encode('utf-8')
+        footer = f'\r\n--{boundary}--\r\n'.encode('utf-8')
+        body = text_bytes + file_hdr + image_bytes + footer
+        req = Request(url, data=body)
+        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+        resp = urlopen(req, timeout=30)
+        resp_data = json.loads(resp.read().decode('utf-8'))
+        atts = resp_data.get('attachments', [])
+        if atts:
+            return atts[0].get('url', '')
+        return 'sent'
+    except Exception as e:
+        last_error = f'{last_error}; urllib: {e}'
+
+    # Log error for debugging
+    try:
+        with open(os.path.join(os.path.dirname(sys.argv[0]), 'discord_error.log'), 'w') as f:
+            f.write(f'Discord upload failed\nURL: {webhook_url[:50]}...\nImage size: {len(image_bytes)}\nError: {last_error}\n')
+    except Exception:
+        pass
     return None
 
 
@@ -832,17 +840,9 @@ class APMApp:
         self.notebook.add(self.tab_distribte, text='Distribte')
         self.notebook.add(self.tab_pos, text='Pos')
 
-        # Top-right controls (Hotkeys checkbox + On top)
-        top_frame = tk.Frame(self.root)
-        top_frame.place(x=220, y=4)
-
+        # Hotkeys + On top vars (checkboxes placed in bottom bar)
         self.hotkeys_var = tk.BooleanVar(value=self.cfg.get('MAIN', 'AllHotkeysON') == '1')
-        tk.Checkbutton(top_frame, text='Hotkeys', variable=self.hotkeys_var,
-                        command=self._toggle_hotkeys).pack(side='left')
-
         self.ontop_var = tk.BooleanVar(value=always_on_top)
-        tk.Checkbutton(top_frame, text='On top', variable=self.ontop_var,
-                        command=self._toggle_ontop).pack(side='left')
 
         self._build_main_tab()
         self._build_settings_tab()
@@ -1247,6 +1247,12 @@ class APMApp:
         # Debug log button
         tk.Button(bottom, text='Debug Log', font=('', 6),
                   command=self._show_debug_log).pack(side='right', padx=2)
+
+        # Hotkeys + On top checkboxes (moved from tab bar area)
+        tk.Checkbutton(bottom, text='On top', variable=self.ontop_var,
+                        font=('', 7), command=self._toggle_ontop).pack(side='right', padx=2)
+        tk.Checkbutton(bottom, text='Hotkeys', variable=self.hotkeys_var,
+                        font=('', 7), command=self._toggle_hotkeys).pack(side='right', padx=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # CORE LOGIC
@@ -1952,7 +1958,7 @@ class APMApp:
                 return
             if not url:
                 self.root.after(0, lambda: self.dc_status.configure(
-                    text='Upload failed (check webhook URL)', fg='red'))
+                    text='Upload failed - check discord_error.log', fg='red'))
                 return
 
             # Log to sheets
