@@ -46,6 +46,8 @@ try:
     user32.EnumWindows.restype = BOOL
     user32.IsWindowVisible.argtypes = [HWND]
     user32.IsWindowVisible.restype = BOOL
+    user32.IsIconic.argtypes = [HWND]
+    user32.IsIconic.restype = BOOL
     user32.GetClassNameW.argtypes = [HWND, ctypes.c_wchar_p, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [HWND, ctypes.c_wchar_p, ctypes.c_int]
@@ -101,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.4"
+VERSION = "3.5"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -195,13 +197,15 @@ def enum_windows():
             class_name = ctypes.create_unicode_buffer(256)
             user32.GetClassNameW(hwnd, class_name, 256)
             if class_name.value == CHROME_CLASS:
-                # Filter out tiny popup/extension windows
-                rect = ctypes.wintypes.RECT()
-                user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                w = rect.right - rect.left
-                h = rect.bottom - rect.top
-                if w < 200 or h < 200:
-                    return True
+                # Filter out tiny popup/extension windows, but keep minimized ones
+                is_minimized = bool(user32.IsIconic(hwnd))
+                if not is_minimized:
+                    rect = ctypes.wintypes.RECT()
+                    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w < 200 or h < 200:
+                        return True
                 title = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, title, 512)
                 if title.value:
@@ -617,10 +621,14 @@ def discord_webhook_send_text(webhook_url, content, username='APM'):
 
 def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.png',
                                   content='', username='APM'):
-    """Upload an image to Discord via webhook.
-    Uses same approach as MLM Manager - BytesIO buffer with requests.post()."""
+    """Upload an image to Discord via webhook using pure stdlib http.client.
+    Constructs raw multipart body like AutoIt WinHttp does."""
     if not webhook_url:
         return None
+
+    log_path = os.path.join(os.path.dirname(sys.argv[0]) or '.', 'discord_debug.log')
+    debug = [f'=== v{VERSION} upload at {time.strftime("%Y-%m-%d %H:%M:%S")} ===',
+             f'Image: {len(image_bytes)} bytes, user: {username}']
 
     url = webhook_url
     if '?' not in url:
@@ -628,84 +636,91 @@ def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.
     elif 'wait=' not in url:
         url += '&wait=true'
 
-    # Always log debug info
-    log_path = os.path.join(os.path.dirname(sys.argv[0]) or '.', 'discord_debug.log')
-    debug_lines = [f'=== Discord upload at {time.strftime("%Y-%m-%d %H:%M:%S")} ===',
-                   f'URL: {webhook_url[:80]}',
-                   f'Image size: {len(image_bytes)} bytes',
-                   f'Username: {username}',
-                   f'Content: {content[:100]}',
-                   f'requests available: {requests is not None}']
+    # Build raw multipart body (same as AutoIt WinHttp approach)
+    import random
+    boundary = f'----APMBoundary{random.randint(100000, 999999)}'
 
-    # Approach 1: requests with BytesIO (same as MLM Manager)
+    body_parts = []
+    # Username field
+    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="username"\r\n\r\n{username}\r\n'.encode('utf-8'))
+    # Content field
+    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="content"\r\n\r\n{content}\r\n'.encode('utf-8'))
+    # File field
+    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file0"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n'.encode('utf-8'))
+    body_parts.append(image_bytes)
+    body_parts.append(f'\r\n--{boundary}--\r\n'.encode('utf-8'))
+    body = b''.join(body_parts)
+
+    content_type = f'multipart/form-data; boundary={boundary}'
+    debug.append(f'Body size: {len(body)}, boundary: {boundary}')
+
+    # Approach 1: http.client (pure stdlib, no dependencies)
+    try:
+        import http.client
+        import ssl
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        debug.append(f'Trying http.client to {parsed.hostname}...')
+        conn = http.client.HTTPSConnection(parsed.hostname, context=ctx, timeout=30)
+        path = parsed.path
+        if parsed.query:
+            path += '?' + parsed.query
+        conn.request('POST', path, body=body, headers={
+            'Content-Type': content_type,
+            'Content-Length': str(len(body)),
+        })
+        resp = conn.getresponse()
+        resp_body = resp.read().decode('utf-8')
+        debug.append(f'http.client status: {resp.status}')
+        debug.append(f'http.client response: {resp_body[:400]}')
+        conn.close()
+
+        if resp.status in [200, 204]:
+            resp_json = json.loads(resp_body)
+            atts = resp_json.get('attachments', [])
+            if atts:
+                debug.append('SUCCESS via http.client')
+                _write_debug_log(log_path, debug)
+                return atts[0].get('url', '')
+            if resp_json.get('id'):
+                debug.append('SUCCESS via http.client (id)')
+                _write_debug_log(log_path, debug)
+                return 'sent'
+            debug.append('WARN: 200 but no attachments')
+        else:
+            debug.append(f'FAILED: HTTP {resp.status}')
+    except Exception as e:
+        debug.append(f'http.client error: {e}')
+
+    # Approach 2: requests (if available)
     if requests:
         try:
+            debug.append('Trying requests fallback...')
             buf = BytesIO(image_bytes)
-            payload = {'username': username, 'content': content}
-            files_dict = {'file0': (filename, buf, 'image/png')}
-            debug_lines.append('Trying requests.post with BytesIO...')
-            r = requests.post(url, data=payload, files=files_dict, timeout=30, verify=False)
-            debug_lines.append(f'Response status: {r.status_code}')
-            debug_lines.append(f'Response body: {r.text[:500]}')
+            r = requests.post(url, data={'username': username, 'content': content},
+                            files={'file0': (filename, buf, 'image/png')},
+                            timeout=30, verify=False)
+            debug.append(f'requests status: {r.status_code}, body: {r.text[:300]}')
             if r.status_code in [200, 204]:
-                try:
-                    resp = r.json()
-                    atts = resp.get('attachments', [])
-                    if atts:
-                        debug_lines.append(f'SUCCESS: attachment URL = {atts[0].get("url", "")[:100]}')
-                        _write_debug_log(log_path, debug_lines)
-                        return atts[0].get('url', '')
-                    if resp.get('id'):
-                        debug_lines.append(f'SUCCESS: message id = {resp.get("id")}')
-                        _write_debug_log(log_path, debug_lines)
-                        return 'sent'
-                    debug_lines.append(f'WARN: 200 but no attachments in response')
-                except Exception as e:
-                    debug_lines.append(f'JSON parse ok but error: {e}')
-                    _write_debug_log(log_path, debug_lines)
+                resp = r.json()
+                atts = resp.get('attachments', [])
+                if atts:
+                    debug.append('SUCCESS via requests')
+                    _write_debug_log(log_path, debug)
+                    return atts[0].get('url', '')
+                if resp.get('id'):
+                    _write_debug_log(log_path, debug)
                     return 'sent'
-            debug_lines.append(f'FAILED: HTTP {r.status_code}')
         except Exception as e:
-            debug_lines.append(f'requests exception: {e}')
+            debug.append(f'requests error: {e}')
 
-    # Approach 2: curl with temp file as fallback
-    try:
-        import tempfile
-        tmp_path = os.path.join(tempfile.gettempdir(), 'apm_discord.png')
-        with open(tmp_path, 'wb') as f:
-            f.write(image_bytes)
-        cmd = ['curl', '-s', '-k', '-X', 'POST',
-               '-F', f'username={username}',
-               '-F', f'content={content}',
-               '-F', f'file0=@{tmp_path};type=image/png;filename={filename}',
-               url]
-        debug_lines.append(f'Trying curl: {" ".join(cmd[:6])}...')
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        debug_lines.append(f'curl rc={result.returncode}')
-        debug_lines.append(f'curl stdout: {result.stdout[:300]}')
-        debug_lines.append(f'curl stderr: {result.stderr[:300]}')
-        if result.returncode == 0 and result.stdout:
-            resp = json.loads(result.stdout)
-            atts = resp.get('attachments', [])
-            if atts:
-                debug_lines.append(f'SUCCESS via curl')
-                _write_debug_log(log_path, debug_lines)
-                return atts[0].get('url', '')
-            if resp.get('id'):
-                debug_lines.append(f'SUCCESS via curl (id only)')
-                _write_debug_log(log_path, debug_lines)
-                return 'sent'
-    except FileNotFoundError:
-        debug_lines.append('curl not found on system')
-    except Exception as e:
-        debug_lines.append(f'curl exception: {e}')
-
-    debug_lines.append('ALL APPROACHES FAILED')
-    _write_debug_log(log_path, debug_lines)
+    debug.append('ALL APPROACHES FAILED')
+    _write_debug_log(log_path, debug)
     return None
 
 
@@ -2012,8 +2027,18 @@ class APMApp:
                     text=f'Upload error: {e}', fg='red'))
                 return
             if not url:
+                # Read debug log for error details
+                err_detail = ''
+                try:
+                    log_p = os.path.join(os.path.dirname(sys.argv[0]) or '.', 'discord_debug.log')
+                    if os.path.exists(log_p):
+                        with open(log_p, 'r') as lf:
+                            lines = lf.read().strip().split('\n')
+                            err_detail = lines[-1] if lines else ''
+                except Exception:
+                    pass
                 self.root.after(0, lambda: self.dc_status.configure(
-                    text='Upload failed - check discord_debug.log', fg='red'))
+                    text=f'v{VERSION} FAILED: {err_detail[:60]}', fg='red'))
                 return
 
             # Log to sheets
@@ -2038,7 +2063,7 @@ class APMApp:
                 with open(os.path.join(date_folder, f'{ts}.png'), 'wb') as f:
                     f.write(img_bytes)
 
-            self.root.after(0, lambda: self.dc_status.configure(text='Screenshot sent!', fg='green'))
+            self.root.after(0, lambda: self.dc_status.configure(text=f'v{VERSION} Screenshot sent!', fg='green'))
 
         threading.Thread(target=do_send, daemon=True).start()
 
