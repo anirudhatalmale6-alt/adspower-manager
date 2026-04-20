@@ -101,7 +101,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.3"
+VERSION = "3.4"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -628,28 +628,45 @@ def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.
     elif 'wait=' not in url:
         url += '&wait=true'
 
-    errors = []
+    # Always log debug info
+    log_path = os.path.join(os.path.dirname(sys.argv[0]) or '.', 'discord_debug.log')
+    debug_lines = [f'=== Discord upload at {time.strftime("%Y-%m-%d %H:%M:%S")} ===',
+                   f'URL: {webhook_url[:80]}',
+                   f'Image size: {len(image_bytes)} bytes',
+                   f'Username: {username}',
+                   f'Content: {content[:100]}',
+                   f'requests available: {requests is not None}']
 
-    # Approach 1: requests with BytesIO (same as MLM Manager - proven working)
+    # Approach 1: requests with BytesIO (same as MLM Manager)
     if requests:
         try:
             buf = BytesIO(image_bytes)
             payload = {'username': username, 'content': content}
             files_dict = {'file0': (filename, buf, 'image/png')}
-            r = requests.post(url, data=payload, files=files_dict, timeout=30)
+            debug_lines.append('Trying requests.post with BytesIO...')
+            r = requests.post(url, data=payload, files=files_dict, timeout=30, verify=False)
+            debug_lines.append(f'Response status: {r.status_code}')
+            debug_lines.append(f'Response body: {r.text[:500]}')
             if r.status_code in [200, 204]:
                 try:
                     resp = r.json()
                     atts = resp.get('attachments', [])
                     if atts:
+                        debug_lines.append(f'SUCCESS: attachment URL = {atts[0].get("url", "")[:100]}')
+                        _write_debug_log(log_path, debug_lines)
                         return atts[0].get('url', '')
                     if resp.get('id'):
+                        debug_lines.append(f'SUCCESS: message id = {resp.get("id")}')
+                        _write_debug_log(log_path, debug_lines)
                         return 'sent'
-                except Exception:
+                    debug_lines.append(f'WARN: 200 but no attachments in response')
+                except Exception as e:
+                    debug_lines.append(f'JSON parse ok but error: {e}')
+                    _write_debug_log(log_path, debug_lines)
                     return 'sent'
-            errors.append(f'requests HTTP {r.status_code}: {r.text[:200]}')
+            debug_lines.append(f'FAILED: HTTP {r.status_code}')
         except Exception as e:
-            errors.append(f'requests: {e}')
+            debug_lines.append(f'requests exception: {e}')
 
     # Approach 2: curl with temp file as fallback
     try:
@@ -657,41 +674,47 @@ def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.
         tmp_path = os.path.join(tempfile.gettempdir(), 'apm_discord.png')
         with open(tmp_path, 'wb') as f:
             f.write(image_bytes)
-        cmd = ['curl', '-s', '-X', 'POST',
+        cmd = ['curl', '-s', '-k', '-X', 'POST',
                '-F', f'username={username}',
                '-F', f'content={content}',
                '-F', f'file0=@{tmp_path};type=image/png;filename={filename}',
                url]
+        debug_lines.append(f'Trying curl: {" ".join(cmd[:6])}...')
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
+        debug_lines.append(f'curl rc={result.returncode}')
+        debug_lines.append(f'curl stdout: {result.stdout[:300]}')
+        debug_lines.append(f'curl stderr: {result.stderr[:300]}')
         if result.returncode == 0 and result.stdout:
             resp = json.loads(result.stdout)
             atts = resp.get('attachments', [])
             if atts:
+                debug_lines.append(f'SUCCESS via curl')
+                _write_debug_log(log_path, debug_lines)
                 return atts[0].get('url', '')
             if resp.get('id'):
+                debug_lines.append(f'SUCCESS via curl (id only)')
+                _write_debug_log(log_path, debug_lines)
                 return 'sent'
-        errors.append(f'curl rc={result.returncode} stderr={result.stderr[:200]}')
     except FileNotFoundError:
-        errors.append('curl not found')
+        debug_lines.append('curl not found on system')
     except Exception as e:
-        errors.append(f'curl: {e}')
+        debug_lines.append(f'curl exception: {e}')
 
-    # Log all errors for debugging
+    debug_lines.append('ALL APPROACHES FAILED')
+    _write_debug_log(log_path, debug_lines)
+    return None
+
+
+def _write_debug_log(path, lines):
     try:
-        log_path = os.path.join(os.path.dirname(sys.argv[0]) or '.', 'discord_error.log')
-        with open(log_path, 'w') as f:
-            f.write(f'Discord upload failed at {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
-            f.write(f'URL: {webhook_url[:60]}...\n')
-            f.write(f'Image size: {len(image_bytes)} bytes\n')
-            for i, err in enumerate(errors):
-                f.write(f'Attempt {i+1}: {err}\n')
+        with open(path, 'a') as f:
+            f.write('\n'.join(lines) + '\n\n')
     except Exception:
         pass
-    return None
 
 
 def log_to_google_sheets(sheet_url, sheet_name, rows):
@@ -1717,9 +1740,41 @@ class APMApp:
         threading.Thread(target=do_switch, daemon=True).start()
 
     def _show_all_browsers(self):
-        for hwnd in self._get_all_hwnds():
-            show_window(hwnd)
-            time.sleep(0.05)
+        """Show all browsers positioned in grid using Pos tab settings."""
+        hwnds = self._get_all_hwnds()
+        if not hwnds:
+            return
+
+        try:
+            cols = max(1, int(self.pos_entries.get('Cols', tk.Entry()).get() or '4'))
+            rows = max(1, int(self.pos_entries.get('Rows', tk.Entry()).get() or '2'))
+            width = int(self.pos_entries.get('Width', tk.Entry()).get() or '480')
+            height = int(self.pos_entries.get('Height', tk.Entry()).get() or '540')
+            gap_x = int(self.pos_entries.get('GapX', tk.Entry()).get() or '0')
+            gap_y = int(self.pos_entries.get('GapY', tk.Entry()).get() or '0')
+        except (ValueError, TypeError):
+            cols, rows, width, height, gap_x, gap_y = 4, 2, 480, 540, 0, 0
+
+        def do_show():
+            for idx, hwnd in enumerate(hwnds):
+                col = idx % cols
+                row = (idx // cols) % rows
+                x = col * (width + gap_x)
+                y = row * (height + gap_y)
+                if HAS_WIN32:
+                    user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+                    time.sleep(0.05)
+                    user32.SetWindowPos(hwnd, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW)
+                else:
+                    show_window(hwnd)
+                    time.sleep(0.05)
+
+        # Reset active group
+        self.active_group = -1
+        for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
+            btn.configure(bg='SystemButtonFace', fg='black')
+
+        threading.Thread(target=do_show, daemon=True).start()
 
     # ── Resize ────────────────────────────────────────────────────────────────
 
@@ -1958,7 +2013,7 @@ class APMApp:
                 return
             if not url:
                 self.root.after(0, lambda: self.dc_status.configure(
-                    text='Upload failed - check discord_error.log', fg='red'))
+                    text='Upload failed - check discord_debug.log', fg='red'))
                 return
 
             # Log to sheets
