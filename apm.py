@@ -101,7 +101,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "2.9"
+VERSION = "3.0"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION}"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -615,64 +615,74 @@ def discord_webhook_send_text(webhook_url, content, username='APM'):
         return False
 
 
-def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles.png',
+def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.png',
                                   content='', username='APM'):
     """Upload an image to Discord via webhook multipart.
-    Uses payload_json format (Discord recommended for webhook file uploads)."""
+    Matches AutoIt _DISCORDWEBHOOKUPLOADMULTI format exactly:
+    - Separate username/content fields (not payload_json)
+    - File field named 'file0' (not 'file')
+    - Manual binary body construction."""
     if not webhook_url:
         return None
 
-    # Build payload_json (Discord's recommended format for webhooks with files)
-    payload = {'username': username}
-    if content:
-        payload['content'] = content
+    # Build multipart body matching AutoIt format exactly
+    import random
+    boundary = f'----PythonBoundary{random.randint(100000, 999999)}'
 
-    # Try requests first
+    # Text parts (username + content) - matching AutoIt format
+    text_part = f'--{boundary}\r\n'
+    text_part += 'Content-Disposition: form-data; name="username"\r\n\r\n'
+    text_part += f'{username}\r\n'
+    text_part += f'--{boundary}\r\n'
+    text_part += 'Content-Disposition: form-data; name="content"\r\n\r\n'
+    text_part += f'{content}\r\n'
+
+    # File header - matching AutoIt: name="file0", filename="profiles_1.png"
+    file_header = f'--{boundary}\r\n'
+    file_header += f'Content-Disposition: form-data; name="file0"; filename="{filename}"\r\n'
+    file_header += 'Content-Type: image/png\r\n\r\n'
+
+    footer = f'\r\n--{boundary}--\r\n'
+
+    # Assemble binary body
+    body = text_part.encode('utf-8') + file_header.encode('utf-8') + image_bytes + footer.encode('utf-8')
+
+    # Ensure ?wait=true
+    if '?' in webhook_url:
+        if 'wait=' not in webhook_url:
+            webhook_url += '&wait=true'
+    else:
+        webhook_url += '?wait=true'
+
+    # Send via urllib (raw binary, like AutoIt's WinHttp)
+    try:
+        req = Request(webhook_url, data=body, method='POST')
+        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+        req.add_header('Content-Length', str(len(body)))
+        resp = urlopen(req, timeout=30)
+        resp_text = resp.read().decode('utf-8')
+        resp_data = json.loads(resp_text)
+        attachments = resp_data.get('attachments', [])
+        if attachments:
+            return attachments[0].get('url', '')
+        return 'sent'
+    except Exception as e:
+        pass
+
+    # Fallback: try with requests if urllib failed
     if requests:
         try:
-            files = {
-                'file': (filename, image_bytes, 'image/png'),
-                'payload_json': (None, json.dumps(payload), 'application/json'),
-            }
-            r = requests.post(webhook_url + '?wait=true', files=files, timeout=20)
+            r = requests.post(webhook_url, data=body,
+                            headers={'Content-Type': f'multipart/form-data; boundary={boundary}'},
+                            timeout=30)
             if r.ok:
                 resp = r.json()
                 attachments = resp.get('attachments', [])
                 if attachments:
                     return attachments[0].get('url', '')
-                return 'sent'  # Image sent even if no URL in response
-            # Log error for debugging
-            return None
+                return 'sent'
         except Exception:
             pass
-
-    # Fallback: manual multipart with urllib
-    try:
-        import uuid
-        boundary = uuid.uuid4().hex
-        body = b''
-        # payload_json field
-        body += f'--{boundary}\r\n'.encode()
-        body += b'Content-Disposition: form-data; name="payload_json"\r\n'
-        body += b'Content-Type: application/json\r\n\r\n'
-        body += json.dumps(payload).encode() + b'\r\n'
-        # File field
-        body += f'--{boundary}\r\n'.encode()
-        body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
-        body += b'Content-Type: image/png\r\n\r\n'
-        body += image_bytes + b'\r\n'
-        body += f'--{boundary}--\r\n'.encode()
-
-        req = Request(webhook_url + '?wait=true', data=body)
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        resp = urlopen(req, timeout=20)
-        resp_data = json.loads(resp.read().decode('utf-8'))
-        attachments = resp_data.get('attachments', [])
-        if attachments:
-            return attachments[0].get('url', '')
-        return 'sent'
-    except Exception:
-        pass
     return None
 
 
