@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.5"
+VERSION = "3.6"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -149,8 +149,8 @@ def load_config():
             'AlwaysOnTop': '0', 'AllHotkeysON': '1',
             'HotkeysToggleExtra': 'CTRL+SHIFT+H',
             'MainURL': 'https://www.ticketmaster.com',
-            'CustomNavSize': '0', 'NavWidth': '480', 'NavHeight': '540',
-            'MinimizeOthers': '1',
+            'CustomNavSize': '1', 'NavWidth': '480', 'NavHeight': '540',
+            'MinimizeOthers': '0',
         },
         'HOTKEYS': {
             'FORWARD': 'CTRL+SHIFT+RIGHT', 'BACKWARD': 'CTRL+SHIFT+LEFT',
@@ -158,7 +158,9 @@ def load_config():
             'SORTPROFILE': 'CTRL+SHIFT+P', 'GROUPNEXT': 'NONE', 'GROUPBACK': 'NONE',
         },
         'DISCORD': {
-            'QueWebhook': '', 'ProdWebhook': '', 'VfWebhook': '',
+            'QueWebhook': 'https://discord.com/api/webhooks/1464267517139877930/Ae0LDeglr3CEYK_vjsTd1htYoevub_ajXCcb4CAWVSGkg-s2XweTo9MIqNiZNNAH_iOQ',
+            'ProdWebhook': 'https://discord.com/api/webhooks/1464267286918594652/tz1Go3i_cGsHz0f08bpAAR_C1wRhw6eU629CrajA4uDxf4kd5L-0ZKbxh6vLduCLibPo',
+            'VfWebhook': 'https://discord.com/api/webhooks/1483812119135912059/hAPUWxiqRVNAw43gjl8L1rLt9M6emWWCpyPjIwS5K0JN6WhyiysyZdky5wGWt6iLpBBr',
             'ProfileName': '', 'ScreenshotFolder': os.path.join(BASE_DIR, 'Screenshots'),
             'SheetUrl': '',
         },
@@ -621,14 +623,13 @@ def discord_webhook_send_text(webhook_url, content, username='APM'):
 
 def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.png',
                                   content='', username='APM'):
-    """Upload an image to Discord via webhook using pure stdlib http.client.
-    Constructs raw multipart body like AutoIt WinHttp does."""
+    """Upload an image to Discord via webhook. Tries requests first, then http.client."""
     if not webhook_url:
         return None
 
     log_path = os.path.join(os.path.dirname(sys.argv[0]) or '.', 'discord_debug.log')
     debug = [f'=== v{VERSION} upload at {time.strftime("%Y-%m-%d %H:%M:%S")} ===',
-             f'Image: {len(image_bytes)} bytes, user: {username}']
+             f'Image: {len(image_bytes)} bytes, user: {username}, content: {content[:50]}']
 
     url = webhook_url
     if '?' not in url:
@@ -636,90 +637,87 @@ def discord_webhook_upload_image(webhook_url, image_bytes, filename='profiles_1.
     elif 'wait=' not in url:
         url += '&wait=true'
 
-    # Build raw multipart body (same as AutoIt WinHttp approach)
-    import random
-    boundary = f'----APMBoundary{random.randint(100000, 999999)}'
+    # Approach 1: requests (uses system proxy, same lib as working text send)
+    if requests:
+        try:
+            debug.append('A1: requests with BytesIO...')
+            buf = BytesIO(image_bytes)
+            r = requests.post(url, data={'username': username, 'content': content},
+                            files={'file0': (filename, buf, 'image/png')},
+                            timeout=30, verify=False)
+            debug.append(f'A1 status: {r.status_code}')
+            debug.append(f'A1 body: {r.text[:400]}')
+            if r.status_code in [200, 204]:
+                resp = r.json()
+                atts = resp.get('attachments', [])
+                if atts:
+                    debug.append('A1 SUCCESS')
+                    _write_debug_log(log_path, debug)
+                    return atts[0].get('url', '')
+                if resp.get('id'):
+                    debug.append('A1 SUCCESS (id only)')
+                    _write_debug_log(log_path, debug)
+                    return 'sent'
+                debug.append('A1 WARN: 200 but no attachments/id')
+            else:
+                debug.append(f'A1 FAILED: HTTP {r.status_code}')
+        except Exception as e:
+            debug.append(f'A1 error: {type(e).__name__}: {e}')
 
-    body_parts = []
-    # Username field
-    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="username"\r\n\r\n{username}\r\n'.encode('utf-8'))
-    # Content field
-    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="content"\r\n\r\n{content}\r\n'.encode('utf-8'))
-    # File field
-    body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file0"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n'.encode('utf-8'))
-    body_parts.append(image_bytes)
-    body_parts.append(f'\r\n--{boundary}--\r\n'.encode('utf-8'))
-    body = b''.join(body_parts)
-
-    content_type = f'multipart/form-data; boundary={boundary}'
-    debug.append(f'Body size: {len(body)}, boundary: {boundary}')
-
-    # Approach 1: http.client (pure stdlib, no dependencies)
+    # Approach 2: http.client (pure stdlib, manual multipart like AutoIt WinHttp)
     try:
+        import random
         import http.client
         import ssl
         from urllib.parse import urlparse
+
+        boundary = f'----APMBoundary{random.randint(100000, 999999)}'
+        body_parts = []
+        body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="username"\r\n\r\n{username}\r\n'.encode('utf-8'))
+        body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="content"\r\n\r\n{content}\r\n'.encode('utf-8'))
+        body_parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file0"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n'.encode('utf-8'))
+        body_parts.append(image_bytes)
+        body_parts.append(f'\r\n--{boundary}--\r\n'.encode('utf-8'))
+        body = b''.join(body_parts)
 
         parsed = urlparse(url)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        debug.append(f'Trying http.client to {parsed.hostname}...')
+        debug.append(f'A2: http.client to {parsed.hostname}, body={len(body)}b...')
         conn = http.client.HTTPSConnection(parsed.hostname, context=ctx, timeout=30)
         path = parsed.path
         if parsed.query:
             path += '?' + parsed.query
         conn.request('POST', path, body=body, headers={
-            'Content-Type': content_type,
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
             'Content-Length': str(len(body)),
         })
         resp = conn.getresponse()
         resp_body = resp.read().decode('utf-8')
-        debug.append(f'http.client status: {resp.status}')
-        debug.append(f'http.client response: {resp_body[:400]}')
+        debug.append(f'A2 status: {resp.status}')
+        debug.append(f'A2 body: {resp_body[:400]}')
         conn.close()
 
         if resp.status in [200, 204]:
             resp_json = json.loads(resp_body)
             atts = resp_json.get('attachments', [])
             if atts:
-                debug.append('SUCCESS via http.client')
+                debug.append('A2 SUCCESS')
                 _write_debug_log(log_path, debug)
                 return atts[0].get('url', '')
             if resp_json.get('id'):
-                debug.append('SUCCESS via http.client (id)')
+                debug.append('A2 SUCCESS (id)')
                 _write_debug_log(log_path, debug)
                 return 'sent'
-            debug.append('WARN: 200 but no attachments')
+            debug.append('A2 WARN: 200 but no attachments')
         else:
-            debug.append(f'FAILED: HTTP {resp.status}')
+            debug.append(f'A2 FAILED: HTTP {resp.status}')
     except Exception as e:
-        debug.append(f'http.client error: {e}')
+        debug.append(f'A2 error: {type(e).__name__}: {e}')
 
-    # Approach 2: requests (if available)
-    if requests:
-        try:
-            debug.append('Trying requests fallback...')
-            buf = BytesIO(image_bytes)
-            r = requests.post(url, data={'username': username, 'content': content},
-                            files={'file0': (filename, buf, 'image/png')},
-                            timeout=30, verify=False)
-            debug.append(f'requests status: {r.status_code}, body: {r.text[:300]}')
-            if r.status_code in [200, 204]:
-                resp = r.json()
-                atts = resp.get('attachments', [])
-                if atts:
-                    debug.append('SUCCESS via requests')
-                    _write_debug_log(log_path, debug)
-                    return atts[0].get('url', '')
-                if resp.get('id'):
-                    _write_debug_log(log_path, debug)
-                    return 'sent'
-        except Exception as e:
-            debug.append(f'requests error: {e}')
-
-    debug.append('ALL APPROACHES FAILED')
+    debug.append('ALL FAILED')
     _write_debug_log(log_path, debug)
     return None
 
