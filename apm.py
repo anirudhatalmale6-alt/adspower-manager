@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.8"
+VERSION = "3.9"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -155,7 +155,7 @@ def load_config():
         'HOTKEYS': {
             'FORWARD': 'CTRL+SHIFT+RIGHT', 'BACKWARD': 'CTRL+SHIFT+LEFT',
             'TOP': 'CTRL+SHIFT+UP', 'SORTTAB': 'CTRL+SHIFT+T',
-            'SORTPROFILE': 'CTRL+SHIFT+P', 'GROUPNEXT': 'NONE', 'GROUPBACK': 'NONE',
+            'SORTPROFILE': 'CTRL+SHIFT+P', 'GROUPNEXT': '[', 'GROUPBACK': ']',
         },
         'DISCORD': {
             'QueWebhook': 'https://discord.com/api/webhooks/1464267517139877930/Ae0LDeglr3CEYK_vjsTd1htYoevub_ajXCcb4CAWVSGkg-s2XweTo9MIqNiZNNAH_iOQ',
@@ -1896,7 +1896,10 @@ class APMApp:
                 if self.stop_url_loop:
                     break
                 self._log(f'Opening URL: {i+1}/{len(hwnds)}')
-                # Activate without maximizing (match AutoIt WinActivate)
+                # Restore minimized windows first, then activate
+                if HAS_WIN32:
+                    user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+                    time.sleep(0.05)
                 activate_window(hwnd)
                 time.sleep(0.15)
                 kb.send('ctrl+t')       # New tab
@@ -2183,32 +2186,25 @@ class APMApp:
             import keyboard as kb
         except ImportError:
             return
-        try:
-            fwd = self.cfg.get('HOTKEYS', 'FORWARD').lower().replace('none', '')
-            bwd = self.cfg.get('HOTKEYS', 'BACKWARD').lower().replace('none', '')
-            top = self.cfg.get('HOTKEYS', 'TOP').lower().replace('none', '')
-            srt = self.cfg.get('HOTKEYS', 'SORTTAB', fallback='').lower().replace('none', '')
-            srp = self.cfg.get('HOTKEYS', 'SORTPROFILE', fallback='').lower().replace('none', '')
 
-            if fwd:
-                kb.add_hotkey(fwd, lambda: self.root.after(0, self._hk_fwd), suppress=False)
-            if bwd:
-                kb.add_hotkey(bwd, lambda: self.root.after(0, self._hk_bck), suppress=False)
-            if top:
-                kb.add_hotkey(top, lambda: self.root.after(0, self._move_top), suppress=False)
-            if srt:
-                kb.add_hotkey(srt, lambda: self.root.after(0, lambda: self._sort_tree(1)), suppress=False)
-            if srp:
-                kb.add_hotkey(srp, lambda: self.root.after(0, lambda: self._sort_tree(0)), suppress=False)
+        hotkey_map = {
+            'FORWARD': lambda: self.root.after(0, self._hk_fwd),
+            'BACKWARD': lambda: self.root.after(0, self._hk_bck),
+            'TOP': lambda: self.root.after(0, self._move_top),
+            'SORTTAB': lambda: self.root.after(0, lambda: self._sort_tree(1)),
+            'SORTPROFILE': lambda: self.root.after(0, lambda: self._sort_tree(0)),
+            'GROUPNEXT': lambda: self.root.after(0, self._group_next),
+            'GROUPBACK': lambda: self.root.after(0, self._group_back),
+        }
 
-            gnx = self.cfg.get('HOTKEYS', 'GROUPNEXT', fallback='').lower().replace('none', '')
-            gbk = self.cfg.get('HOTKEYS', 'GROUPBACK', fallback='').lower().replace('none', '')
-            if gnx:
-                kb.add_hotkey(gnx, lambda: self.root.after(0, self._group_next), suppress=False)
-            if gbk:
-                kb.add_hotkey(gbk, lambda: self.root.after(0, self._group_back), suppress=False)
-        except Exception as e:
-            self._log(f'Hotkey error: {e}')
+        for key_name, callback in hotkey_map.items():
+            try:
+                combo = self.cfg.get('HOTKEYS', key_name, fallback='').lower().replace('none', '').strip()
+                if combo:
+                    kb.add_hotkey(combo, callback, suppress=False)
+                    self._log(f'Hotkey registered: {key_name}={combo}')
+            except Exception as e:
+                self._log(f'Hotkey {key_name} error: {e}')
 
     def _unregister_hotkeys(self):
         try:
