@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.7"
+VERSION = "3.8"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -1438,8 +1438,8 @@ class APMApp:
             count = len(self.tree.get_children())
             self.tree.heading('profile', text=f'Profile ({count})')
 
-            # 4. Sort only when something changed
-            if needs_sort and self.opt_autosorting.get():
+            # 4. Sort when something changed (always re-sort to maintain order)
+            if needs_sort:
                 self._sort_tree(self.sort_by)
 
             # 5. Update current_pos to match selected item's position
@@ -1746,6 +1746,44 @@ class APMApp:
                 idx += 1
 
         threading.Thread(target=do_switch, daemon=True).start()
+
+    def _group_next(self):
+        """Switch to next group (like AutoIt GROUPNEXT hotkey)."""
+        hwnds = self._get_all_hwnds()
+        if not hwnds:
+            return
+        try:
+            cols = max(1, int(self.pos_entries.get('Cols', tk.Entry()).get() or '4'))
+            rows = max(1, int(self.pos_entries.get('Rows', tk.Entry()).get() or '2'))
+        except (ValueError, TypeError):
+            cols, rows = 4, 2
+        group_size = cols * rows
+        total_groups = math.ceil(len(hwnds) / group_size)
+        if total_groups == 0:
+            return
+        next_group = self.active_group + 1
+        if next_group >= total_groups:
+            next_group = 0
+        self._switch_group(next_group)
+
+    def _group_back(self):
+        """Switch to previous group (like AutoIt GROUPBACK hotkey)."""
+        hwnds = self._get_all_hwnds()
+        if not hwnds:
+            return
+        try:
+            cols = max(1, int(self.pos_entries.get('Cols', tk.Entry()).get() or '4'))
+            rows = max(1, int(self.pos_entries.get('Rows', tk.Entry()).get() or '2'))
+        except (ValueError, TypeError):
+            cols, rows = 4, 2
+        group_size = cols * rows
+        total_groups = math.ceil(len(hwnds) / group_size)
+        if total_groups == 0:
+            return
+        prev_group = self.active_group - 1
+        if prev_group < 0:
+            prev_group = total_groups - 1
+        self._switch_group(prev_group)
 
     def _show_all_browsers(self):
         """Show all browsers positioned in grid using Pos tab settings."""
@@ -2162,6 +2200,13 @@ class APMApp:
                 kb.add_hotkey(srt, lambda: self.root.after(0, lambda: self._sort_tree(1)), suppress=False)
             if srp:
                 kb.add_hotkey(srp, lambda: self.root.after(0, lambda: self._sort_tree(0)), suppress=False)
+
+            gnx = self.cfg.get('HOTKEYS', 'GROUPNEXT', fallback='').lower().replace('none', '')
+            gbk = self.cfg.get('HOTKEYS', 'GROUPBACK', fallback='').lower().replace('none', '')
+            if gnx:
+                kb.add_hotkey(gnx, lambda: self.root.after(0, self._group_next), suppress=False)
+            if gbk:
+                kb.add_hotkey(gbk, lambda: self.root.after(0, self._group_back), suppress=False)
         except Exception as e:
             self._log(f'Hotkey error: {e}')
 
