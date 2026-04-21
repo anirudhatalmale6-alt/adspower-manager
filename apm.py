@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.6"
+VERSION = "3.7"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -1129,15 +1129,8 @@ class APMApp:
         self.dc_message.grid(row=row, column=1, padx=4, pady=2)
         row += 1
 
-        btn_frame = tk.Frame(f)
-        btn_frame.grid(row=row, column=0, columnspan=2, pady=4)
-        tk.Button(btn_frame, text='Send to QUE', command=lambda: self._discord_send('que')).pack(side='left', padx=2)
-        tk.Button(btn_frame, text='Send to PROD', command=lambda: self._discord_send('prod')).pack(side='left', padx=2)
-        tk.Button(btn_frame, text='Send VF', command=lambda: self._discord_send('vf')).pack(side='left', padx=2)
-        row += 1
-
         btn_frame2 = tk.Frame(f)
-        btn_frame2.grid(row=row, column=0, columnspan=2, pady=2)
+        btn_frame2.grid(row=row, column=0, columnspan=2, pady=4)
         tk.Button(btn_frame2, text='QUE Screenshot', command=lambda: self._discord_screenshot('que')).pack(side='left', padx=2)
         tk.Button(btn_frame2, text='PROD Screenshot', command=lambda: self._discord_screenshot('prod')).pack(side='left', padx=2)
         tk.Button(btn_frame2, text='VF Screenshot', command=lambda: self._discord_screenshot('vf')).pack(side='left', padx=2)
@@ -1266,12 +1259,24 @@ class APMApp:
     # ── BOTTOM BAR ────────────────────────────────────────────────────────────
 
     def _build_bottom_bar(self):
+        # Top row: Hotkeys, On top, Debug Log
+        top_bar = tk.Frame(self.root)
+        top_bar.pack(fill='x', side='bottom', padx=4, pady=(0, 1))
+
+        tk.Checkbutton(top_bar, text='Hotkeys', variable=self.hotkeys_var,
+                        font=('', 7), command=self._toggle_hotkeys).pack(side='left', padx=2)
+        tk.Checkbutton(top_bar, text='On top', variable=self.ontop_var,
+                        font=('', 7), command=self._toggle_ontop).pack(side='left', padx=2)
+        tk.Button(top_bar, text='Debug Log', font=('', 6),
+                  command=self._show_debug_log).pack(side='right', padx=2)
+
+        # Bottom row: Version, URL, Open, Stop
         bottom = tk.Frame(self.root)
         bottom.pack(fill='x', side='bottom', padx=4, pady=(0, 4))
 
         tk.Label(bottom, text=f'APM v{VERSION}', font=('', 7), fg='gray').pack(side='left')
 
-        self.main_url = tk.Entry(bottom, font=('', 8), width=22)
+        self.main_url = tk.Entry(bottom, font=('', 8), width=18)
         self.main_url.insert(0, self.cfg.get('MAIN', 'MainURL'))
         self.main_url.pack(side='left', padx=4)
 
@@ -1279,16 +1284,6 @@ class APMApp:
                   command=self._open_url_all).pack(side='left', padx=2)
         tk.Button(bottom, text='STOP', font=('', 7, 'bold'), fg='white', bg='red',
                   command=self._stop_url).pack(side='left', padx=2)
-
-        # Debug log button
-        tk.Button(bottom, text='Debug Log', font=('', 6),
-                  command=self._show_debug_log).pack(side='right', padx=2)
-
-        # Hotkeys + On top checkboxes (moved from tab bar area)
-        tk.Checkbutton(bottom, text='On top', variable=self.ontop_var,
-                        font=('', 7), command=self._toggle_ontop).pack(side='right', padx=2)
-        tk.Checkbutton(bottom, text='Hotkeys', variable=self.hotkeys_var,
-                        font=('', 7), command=self._toggle_hotkeys).pack(side='right', padx=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # CORE LOGIC
