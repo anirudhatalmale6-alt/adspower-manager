@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "3.9"
+VERSION = "4.0"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -114,6 +114,7 @@ SW_RESTORE = 9
 SW_MAXIMIZE = 3
 SW_SHOW = 5
 SWP_SHOWWINDOW = 0x0040
+SWP_FRAMECHANGED = 0x0020
 SWP_NOACTIVATE = 0x0010
 HWND_TOP = 0
 GW_OWNER = 4
@@ -364,14 +365,14 @@ def restore_and_resize(hwnd, w, h):
     """Restore window (un-maximize) and resize to w x h, positioned at left side (0,0)."""
     if HAS_WIN32:
         user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetWindowPos(hwnd, None, 0, 0, w, h, 0x0040)  # SWP_SHOWWINDOW
+        user32.SetWindowPos(hwnd, None, 0, 0, w, h, SWP_SHOWWINDOW | SWP_FRAMECHANGED)
         force_foreground(hwnd)
 
 
 def set_window_pos(hwnd, x, y, w, h):
     if HAS_WIN32:
         user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW)
+        user32.SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW | SWP_FRAMECHANGED)
         user32.SetForegroundWindow(hwnd)
 
 
@@ -1570,7 +1571,7 @@ class APMApp:
             x, y = rect.left, rect.top
             if x < 0 or y < 0:
                 x, y = 100, 100
-            user32.SetWindowPos(hwnd, None, x, y, w, h, 0x0040)
+            user32.SetWindowPos(hwnd, None, x, y, w, h, SWP_SHOWWINDOW | SWP_FRAMECHANGED)
             force_foreground(hwnd)
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -1688,7 +1689,8 @@ class APMApp:
             # Toggle off
             self.active_group = -1
             for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
-                btn.configure(bg='SystemButtonFace', fg='black')
+                btn.configure(bg='#E0E0E0', fg='black', activebackground='#D0D0D0',
+                              activeforeground='black', relief='raised')
             return
 
         # Read positioner settings
@@ -1719,9 +1721,11 @@ class APMApp:
         # Highlight active button, reset others
         for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
             if idx == group_index:
-                btn.configure(bg='#4CA070', fg='white')
+                btn.configure(bg='#2E8B57', fg='white', activebackground='#3CB371',
+                              activeforeground='white', relief='sunken')
             else:
-                btn.configure(bg='SystemButtonFace', fg='black')
+                btn.configure(bg='#E0E0E0', fg='black', activebackground='#D0D0D0',
+                              activeforeground='black', relief='raised')
 
         def do_switch():
             # Step 1: Minimize all windows NOT in this group
@@ -1742,7 +1746,7 @@ class APMApp:
                 if HAS_WIN32:
                     user32.ShowWindow(hwnd, SW_SHOWNORMAL)
                     time.sleep(0.05)
-                    user32.SetWindowPos(hwnd, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW)
+                    user32.SetWindowPos(hwnd, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW | SWP_FRAMECHANGED)
                 idx += 1
 
         threading.Thread(target=do_switch, daemon=True).start()
@@ -1810,7 +1814,7 @@ class APMApp:
                 if HAS_WIN32:
                     user32.ShowWindow(hwnd, SW_SHOWNORMAL)
                     time.sleep(0.05)
-                    user32.SetWindowPos(hwnd, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW)
+                    user32.SetWindowPos(hwnd, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW | SWP_FRAMECHANGED)
                 else:
                     show_window(hwnd)
                     time.sleep(0.05)
@@ -1818,7 +1822,8 @@ class APMApp:
         # Reset active group
         self.active_group = -1
         for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
-            btn.configure(bg='SystemButtonFace', fg='black')
+            btn.configure(bg='#E0E0E0', fg='black', activebackground='#D0D0D0',
+                          activeforeground='black', relief='raised')
 
         threading.Thread(target=do_show, daemon=True).start()
 
