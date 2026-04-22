@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.0"
+VERSION = "4.1"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -1464,7 +1464,15 @@ class APMApp:
         try:
             self.sort_by = col
             items = [(self.tree.set(k, ('profile', 'tab')[col]), k) for k in self.tree.get_children()]
-            items.sort(key=lambda x: x[0].lower())
+
+            def sort_key(x):
+                val = x[0].strip()
+                try:
+                    return (0, float(val))
+                except (ValueError, TypeError):
+                    return (1, val.lower())
+
+            items.sort(key=sort_key, reverse=True)
             for i, (_, k) in enumerate(items):
                 self.tree.move(k, '', i)
         finally:
