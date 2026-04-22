@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.1"
+VERSION = "4.2"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -818,6 +818,8 @@ class APMApp:
         self.browser_move_in_progress = False
         self.active_group = -1
         self.sort_by = 0  # 0=profile, 1=tab
+        self.sort_reverse = True  # True=descending (highest first), False=ascending
+        self.user_sorted = False  # only sort when user clicks header
         self.hotkeys_on = True
         self.extra_hotkeys_on = False
         self.pid_profile_cache = {}  # pid -> profile_name
@@ -1439,9 +1441,9 @@ class APMApp:
             count = len(self.tree.get_children())
             self.tree.heading('profile', text=f'Profile ({count})')
 
-            # 4. Sort when something changed (always re-sort to maintain order)
-            if needs_sort:
-                self._sort_tree(self.sort_by)
+            # 4. Re-sort only if user has manually sorted before
+            if needs_sort and self.user_sorted:
+                self._sort_tree(self.sort_by, toggle=False)
 
             # 5. Update current_pos to match selected item's position
             sel = self.tree.selection()
@@ -1454,7 +1456,7 @@ class APMApp:
         finally:
             self._refreshing_tree = False
 
-    def _sort_tree(self, col):
+    def _sort_tree(self, col, toggle=True):
         # Debounce: ignore rapid sort clicks (within 300ms)
         now = time.time()
         if hasattr(self, '_last_sort_time') and (now - self._last_sort_time) < 0.3:
@@ -1462,6 +1464,12 @@ class APMApp:
         self._last_sort_time = now
         self._sorting_in_progress = True
         try:
+            if toggle:
+                if col == self.sort_by:
+                    self.sort_reverse = not self.sort_reverse
+                else:
+                    self.sort_reverse = True
+                self.user_sorted = True
             self.sort_by = col
             items = [(self.tree.set(k, ('profile', 'tab')[col]), k) for k in self.tree.get_children()]
 
@@ -1472,9 +1480,19 @@ class APMApp:
                 except (ValueError, TypeError):
                     return (1, val.lower())
 
-            items.sort(key=sort_key, reverse=True)
+            items.sort(key=sort_key, reverse=self.sort_reverse)
             for i, (_, k) in enumerate(items):
                 self.tree.move(k, '', i)
+
+            col_name = ('profile', 'tab')[col]
+            arrow = ' v' if self.sort_reverse else ' ^'
+            count = len(self.tree.get_children())
+            if col == 0:
+                self.tree.heading('profile', text=f'Profile ({count}){arrow}')
+                self.tree.heading('tab', text='Tab')
+            else:
+                self.tree.heading('profile', text=f'Profile ({count})')
+                self.tree.heading('tab', text=f'Tab{arrow}')
         finally:
             self._sorting_in_progress = False
 
