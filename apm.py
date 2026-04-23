@@ -1441,9 +1441,8 @@ class APMApp:
             count = len(self.tree.get_children())
             self.tree.heading('profile', text=f'Profile ({count})')
 
-            # 4. Re-sort only if user has manually sorted before
-            if needs_sort and self.user_sorted:
-                self._sort_tree(self.sort_by, toggle=False)
+            # 4. No auto-sort - sorting only happens when user clicks column header
+            # (matches MLM behavior)
 
             # 5. Update current_pos to match selected item's position
             sel = self.tree.selection()
