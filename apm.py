@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.7"
+VERSION = "4.8"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -188,7 +188,8 @@ def save_config(cfg):
 
 def enum_windows():
     """Get all visible windows with Chrome_WidgetWin_1 class.
-    Matches AutoIt WinList behavior - no size filter."""
+    Matches AutoIt WinList behavior - no size filter.
+    Also includes windows with empty titles (assigned '[no title]')."""
     if not HAS_WIN32:
         return []
     results = []
@@ -202,8 +203,34 @@ def enum_windows():
             if class_name.value == CHROME_CLASS:
                 title = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, title, 512)
-                if title.value:
-                    results.append((hwnd, title.value))
+                results.append((hwnd, title.value or '[no title]'))
+        except Exception:
+            pass
+        return True
+    cb = WNDENUMPROC(callback)
+    user32.EnumWindows(cb, 0)
+    return results
+
+
+def enum_all_windows_for_pids(target_pids):
+    """Find ALL visible windows belonging to specific PIDs, any class.
+    Used for diagnostics to detect windows with non-standard class names."""
+    if not HAS_WIN32:
+        return []
+    results = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def callback(hwnd, _):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in target_pids:
+                class_name = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, class_name, 256)
+                title = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, title, 512)
+                results.append((hwnd, title.value, class_name.value, pid.value))
         except Exception:
             pass
         return True
@@ -1305,11 +1332,22 @@ class APMApp:
         self._scan_log_count += 1
         verbose = self._scan_log_count <= 5 or self._scan_log_count % 20 == 0
         if verbose:
-            self._log(f'Scan: {len(chrome_windows)} Chrome windows found')
+            self._log(f'Scan: {len(chrome_windows)} Chrome_WidgetWin_1 windows')
             for hw, t in chrome_windows:
                 pid = get_window_pid(hw)
                 sun = self.sunpid_cache.get(pid, '?')
                 self._log(f'  hwnd={hw} pid={pid} sun={sun} title={t[:50]}')
+            # PID-based diagnostic: find ALL windows for known SunBrowser PIDs
+            sun_pids = {p for p, v in self.sunpid_cache.items() if v}
+            if sun_pids:
+                all_wins = enum_all_windows_for_pids(sun_pids)
+                non_chrome = [w for w in all_wins if w[2] != CHROME_CLASS]
+                if non_chrome:
+                    self._log(f'  Extra SunBrowser windows (non-Chrome class):')
+                    for hw, t, cls, pid in non_chrome:
+                        self._log(f'    hwnd={hw} pid={pid} class={cls} title={t[:40]}')
+                chrome_count = len([w for w in all_wins if w[2] == CHROME_CLASS])
+                self._log(f'  SunBrowser PIDs: {len(sun_pids)}, Chrome wins: {chrome_count}, Other wins: {len(non_chrome)}')
 
         # Refresh cmdline cache every 30s (profile cache stays permanent like AutoIt)
         now = time.time()
