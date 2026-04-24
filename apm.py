@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.5"
+VERSION = "4.6"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -955,11 +955,12 @@ class APMApp:
                 if idx >= 26:
                     break
                 letter = chr(65 + idx)
-                btn = tk.Button(row_frame, text=letter, font=('', 6, 'bold'),
-                                width=2, height=1, padx=0, pady=0,
-                                command=lambda l=idx: self._switch_group(l))
-                btn.pack(side='left', padx=1)
-                self.grp_btns[idx] = btn
+                lbl = tk.Label(row_frame, text=letter, font=('', 6, 'bold'),
+                               width=2, padx=1, pady=0, relief='raised', bd=1,
+                               bg='#E0E0E0', fg='black', cursor='hand2')
+                lbl.bind('<Button-1>', lambda e, l=idx: self._switch_group(l))
+                lbl.pack(side='left', padx=1)
+                self.grp_btns[idx] = lbl
 
         # W/H resize
         size_frame = tk.Frame(side)
@@ -1244,11 +1245,12 @@ class APMApp:
                 if idx >= 26:
                     break
                 letter = chr(65 + idx)
-                btn = tk.Button(row_frame, text=letter, font=('', 8, 'bold'),
-                                width=3, height=1,
-                                command=lambda l=idx: self._switch_group(l))
-                btn.pack(side='left', padx=1, pady=1)
-                self.pos_grp_btns[idx] = btn
+                lbl = tk.Label(row_frame, text=letter, font=('', 8, 'bold'),
+                               width=3, padx=2, pady=1, relief='raised', bd=1,
+                               bg='#E0E0E0', fg='black', cursor='hand2')
+                lbl.bind('<Button-1>', lambda e, l=idx: self._switch_group(l))
+                lbl.pack(side='left', padx=1, pady=1)
+                self.pos_grp_btns[idx] = lbl
 
     # ── BOTTOM BAR ────────────────────────────────────────────────────────────
 
@@ -1707,8 +1709,7 @@ class APMApp:
             for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
                 letter = chr(65 + idx)
                 btn.configure(text=letter, bg='#E0E0E0', fg='black',
-                              activebackground='#D0D0D0', activeforeground='black',
-                              relief='raised', highlightthickness=0)
+                              relief='raised', bd=1)
             return
 
         # Read positioner settings
@@ -1740,14 +1741,11 @@ class APMApp:
         for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
             letter = chr(65 + idx)
             if idx == group_index:
-                btn.configure(text=f'[{letter}]', bg='#2E8B57', fg='white',
-                              activebackground='#3CB371', activeforeground='white',
-                              relief='sunken', highlightbackground='#2E8B57',
-                              highlightcolor='#2E8B57', highlightthickness=2)
+                btn.configure(text=f'[{letter}]', bg='#00AA00', fg='white',
+                              relief='sunken', bd=2)
             else:
                 btn.configure(text=letter, bg='#E0E0E0', fg='black',
-                              activebackground='#D0D0D0', activeforeground='black',
-                              relief='raised', highlightthickness=0)
+                              relief='raised', bd=1)
 
         def do_switch():
             # Step 1: Minimize all windows NOT in this group
