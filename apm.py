@@ -1714,8 +1714,10 @@ class APMApp:
             # Toggle off
             self.active_group = -1
             for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
-                btn.configure(bg='#E0E0E0', fg='black', activebackground='#D0D0D0',
-                              activeforeground='black', relief='raised')
+                letter = chr(65 + idx)
+                btn.configure(text=letter, bg='#E0E0E0', fg='black',
+                              activebackground='#D0D0D0', activeforeground='black',
+                              relief='raised', highlightthickness=0)
             return
 
         # Read positioner settings
@@ -1745,12 +1747,16 @@ class APMApp:
         self.active_group = group_index
         # Highlight active button, reset others
         for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
+            letter = chr(65 + idx)
             if idx == group_index:
-                btn.configure(bg='#2E8B57', fg='white', activebackground='#3CB371',
-                              activeforeground='white', relief='sunken')
+                btn.configure(text=f'[{letter}]', bg='#2E8B57', fg='white',
+                              activebackground='#3CB371', activeforeground='white',
+                              relief='sunken', highlightbackground='#2E8B57',
+                              highlightcolor='#2E8B57', highlightthickness=2)
             else:
-                btn.configure(bg='#E0E0E0', fg='black', activebackground='#D0D0D0',
-                              activeforeground='black', relief='raised')
+                btn.configure(text=letter, bg='#E0E0E0', fg='black',
+                              activebackground='#D0D0D0', activeforeground='black',
+                              relief='raised', highlightthickness=0)
 
         def do_switch():
             # Step 1: Minimize all windows NOT in this group
@@ -1847,8 +1853,10 @@ class APMApp:
         # Reset active group
         self.active_group = -1
         for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
-            btn.configure(bg='#E0E0E0', fg='black', activebackground='#D0D0D0',
-                          activeforeground='black', relief='raised')
+            letter = chr(65 + idx)
+            btn.configure(text=letter, bg='#E0E0E0', fg='black',
+                          activebackground='#D0D0D0', activeforeground='black',
+                          relief='raised', highlightthickness=0)
 
         threading.Thread(target=do_show, daemon=True).start()
 
