@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.2"
+VERSION = "4.5"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -188,7 +188,7 @@ def save_config(cfg):
 
 def enum_windows():
     """Get all visible windows with Chrome_WidgetWin_1 class.
-    Filters out tiny popup/extension windows (< 200x200)."""
+    Matches AutoIt WinList behavior - no size filter."""
     if not HAS_WIN32:
         return []
     results = []
@@ -200,15 +200,6 @@ def enum_windows():
             class_name = ctypes.create_unicode_buffer(256)
             user32.GetClassNameW(hwnd, class_name, 256)
             if class_name.value == CHROME_CLASS:
-                # Filter out tiny popup/extension windows, but keep minimized ones
-                is_minimized = bool(user32.IsIconic(hwnd))
-                if not is_minimized:
-                    rect = ctypes.wintypes.RECT()
-                    user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                    w = rect.right - rect.left
-                    h = rect.bottom - rect.top
-                    if w < 200 or h < 200:
-                        return True
                 title = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, title, 512)
                 if title.value:
