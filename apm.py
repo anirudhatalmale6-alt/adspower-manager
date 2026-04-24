@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.8"
+VERSION = "4.9"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -187,9 +187,9 @@ def save_config(cfg):
 # ─── Win32 Browser Management ────────────────────────────────────────────────
 
 def enum_windows():
-    """Get all visible windows with Chrome_WidgetWin_1 class.
-    Matches AutoIt WinList behavior - no size filter.
-    Also includes windows with empty titles (assigned '[no title]')."""
+    """Get all visible windows with Chrome_WidgetWin_* class.
+    SunBrowser uses Chrome_WidgetWin_1 for main windows but
+    Chrome_WidgetWin_2/3/4/etc for dragged-out tab windows."""
     if not HAS_WIN32:
         return []
     results = []
@@ -200,10 +200,11 @@ def enum_windows():
                 return True
             class_name = ctypes.create_unicode_buffer(256)
             user32.GetClassNameW(hwnd, class_name, 256)
-            if class_name.value == CHROME_CLASS:
+            if class_name.value.startswith('Chrome_WidgetWin_'):
                 title = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, title, 512)
-                results.append((hwnd, title.value or '[no title]'))
+                if title.value:
+                    results.append((hwnd, title.value))
         except Exception:
             pass
         return True
