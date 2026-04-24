@@ -103,7 +103,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.6"
+VERSION = "4.7"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -1303,8 +1303,13 @@ class APMApp:
         if not hasattr(self, '_scan_log_count'):
             self._scan_log_count = 0
         self._scan_log_count += 1
-        if self._scan_log_count <= 3 or self._scan_log_count % 20 == 0:
+        verbose = self._scan_log_count <= 5 or self._scan_log_count % 20 == 0
+        if verbose:
             self._log(f'Scan: {len(chrome_windows)} Chrome windows found')
+            for hw, t in chrome_windows:
+                pid = get_window_pid(hw)
+                sun = self.sunpid_cache.get(pid, '?')
+                self._log(f'  hwnd={hw} pid={pid} sun={sun} title={t[:50]}')
 
         # Refresh cmdline cache every 30s (profile cache stays permanent like AutoIt)
         now = time.time()
@@ -1706,7 +1711,8 @@ class APMApp:
         if self.active_group == group_index:
             # Toggle off
             self.active_group = -1
-            for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
+            all_btns = list(self.grp_btns.items()) + list(self.pos_grp_btns.items())
+            for idx, btn in all_btns:
                 letter = chr(65 + idx)
                 btn.configure(text=letter, bg='#E0E0E0', fg='black',
                               relief='raised', bd=1)
@@ -1737,8 +1743,9 @@ class APMApp:
         end = min(start + group_size, count)
 
         self.active_group = group_index
-        # Highlight active button, reset others
-        for idx, btn in {**self.grp_btns, **self.pos_grp_btns}.items():
+        # Highlight active button, reset others (iterate both sets separately)
+        all_btns = list(self.grp_btns.items()) + list(self.pos_grp_btns.items())
+        for idx, btn in all_btns:
             letter = chr(65 + idx)
             if idx == group_index:
                 btn.configure(text=f'[{letter}]', bg='#00AA00', fg='white',
