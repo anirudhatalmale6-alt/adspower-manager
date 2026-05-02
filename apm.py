@@ -28,6 +28,12 @@ try:
 except ImportError:
     requests = None
 
+try:
+    import uiautomation as auto
+    HAS_UIA = True
+except ImportError:
+    HAS_UIA = False
+
 # Windows API with proper 64-bit type declarations
 try:
     user32 = ctypes.windll.user32
@@ -2311,6 +2317,38 @@ class APMApp:
                 self.api.get_user_list(force=True)
                 time.sleep(30)
         threading.Thread(target=cache_loop, daemon=True).start()
+
+        if HAS_UIA:
+            threading.Thread(target=self._chrome_profile_monitor, daemon=True).start()
+            self._log('Chrome profile auto-saver started')
+        else:
+            self._log('uiautomation not installed, Chrome profile auto-saver disabled')
+
+    def _chrome_profile_monitor(self):
+        """Auto-click 'Continue as' button when SunBrowser profile save popup appears."""
+        while self.running:
+            try:
+                desktop = auto.GetRootControl()
+                windows = desktop.GetChildren()
+                for win in windows:
+                    try:
+                        if win.ClassName != 'Chrome_WidgetWin_1':
+                            continue
+                        btn = win.ButtonControl(
+                            searchDepth=8,
+                            FoundIndex=1,
+                            RegexName=r'(?i)continue\s+as\s+.*'
+                        )
+                        if btn.Exists(maxSearchSeconds=0.1):
+                            name = btn.Name
+                            btn.Click(simulateMove=False)
+                            self._log(f'Chrome profile saved: clicked "{name}"')
+                            time.sleep(3)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(3)
 
     # ── Debug Log ─────────────────────────────────────────────────────────────
 

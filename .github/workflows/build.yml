@@ -18,7 +18,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests websocket-client keyboard pywin32 Pillow pyinstaller
+          pip install requests websocket-client keyboard pywin32 Pillow pyinstaller uiautomation
 
       - name: Build EXE
         run: |
