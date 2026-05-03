@@ -2334,74 +2334,138 @@ class APMApp:
 
     def _chrome_profile_monitor(self):
         """Auto-click 'Continue as' button via Chrome DevTools Protocol."""
-        clicked_ports = set()
+        clicked_targets = set()
+        first_scan = True
         while self.running:
             if not self.opt_profile_saver.get():
                 time.sleep(3)
                 continue
             try:
-                for base in self.api.bases:
-                    try:
-                        resp_data = self.api._get('/api/v1/browser/active?page=1&page_size=200')
-                        if not resp_data or resp_data.get('code') != 0:
-                            continue
-                        data = resp_data.get('data', {})
-                        browsers = data.get('list', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                        for b in browsers:
-                            ws_info = b.get('ws', {}) if isinstance(b.get('ws'), dict) else {}
-                            selenium = ws_info.get('selenium', '') or str(b.get('debug_port', ''))
-                            if not selenium:
-                                continue
-                            m = re.search(r':(\d+)', str(selenium))
-                            if not m:
-                                continue
-                            port = int(m.group(1))
-                            if port in clicked_ports:
-                                continue
-                            serial = str(b.get('serial_number', '') or '').strip()
-                            if self._try_click_signin(port, serial):
-                                clicked_ports.add(port)
-                        break
-                    except Exception:
-                        pass
-                if len(clicked_ports) > 500:
-                    clicked_ports.clear()
-            except Exception:
-                pass
+                resp_data = self.api._get('/api/v1/browser/active?page=1&page_size=200')
+                if not resp_data or resp_data.get('code') != 0:
+                    if first_scan:
+                        self._log(f'[ProfileSaver] API returned: {resp_data}')
+                        first_scan = False
+                    time.sleep(5)
+                    continue
+                data = resp_data.get('data', {})
+                browsers = data.get('list', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                if first_scan:
+                    self._log(f'[ProfileSaver] Found {len(browsers)} active browser(s)')
+                    first_scan = False
+                for b in browsers:
+                    ws_info = b.get('ws', {}) if isinstance(b.get('ws'), dict) else {}
+                    selenium = ws_info.get('selenium', '') or str(b.get('debug_port', ''))
+                    if not selenium:
+                        continue
+                    m = re.search(r':(\d+)', str(selenium))
+                    if not m:
+                        continue
+                    port = int(m.group(1))
+                    serial = str(b.get('serial_number', '') or '').strip()
+                    self._try_click_signin(port, serial, clicked_targets)
+            except Exception as e:
+                self._log(f'[ProfileSaver] Error: {e}')
+            if len(clicked_targets) > 1000:
+                clicked_targets.clear()
             time.sleep(5)
 
-    def _try_click_signin(self, debug_port, serial):
+    def _try_click_signin(self, debug_port, serial, clicked_targets):
         """Check browser for signin popup and click accept via CDP."""
+        label = f'#{serial}' if serial else f'port {debug_port}'
         try:
+            # Method 1: Direct target list - check /json for signin page
             url = f'http://127.0.0.1:{debug_port}/json'
             req = Request(url)
             with urlopen(req, timeout=2) as r:
                 targets = json.loads(r.read().decode())
             for target in targets:
-                if 'signin-dice-web-intercept' not in target.get('url', ''):
-                    continue
-                ws_url = target.get('webSocketDebuggerUrl', '')
-                if not ws_url:
-                    continue
-                ws = _ws_mod.create_connection(ws_url, timeout=3)
-                cmd = json.dumps({
-                    'id': 1,
-                    'method': 'Runtime.evaluate',
-                    'params': {
-                        'expression': '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return "ok"}return "nf"})()'
-                    }
-                })
-                ws.send(cmd)
-                result = json.loads(ws.recv())
+                t_url = target.get('url', '')
+                tid = target.get('id', '')
+                if 'signin' in t_url.lower() and tid not in clicked_targets:
+                    ws_url = target.get('webSocketDebuggerUrl', '')
+                    if ws_url and self._cdp_click_accept(ws_url):
+                        clicked_targets.add(tid)
+                        self._log(f'Chrome profile saved for {label}')
+                        return
+
+            # Method 2: Browser-level CDP to find top-chrome WebUI targets
+            url2 = f'http://127.0.0.1:{debug_port}/json/version'
+            req2 = Request(url2)
+            with urlopen(req2, timeout=2) as r2:
+                version = json.loads(r2.read().decode())
+            browser_ws = version.get('webSocketDebuggerUrl', '')
+            if not browser_ws:
+                return
+            ws = _ws_mod.create_connection(browser_ws, timeout=5)
+            ws.send(json.dumps({'id': 1, 'method': 'Target.getTargets'}))
+            result = self._cdp_read_response(ws, 1)
+            if not result:
                 ws.close()
-                val = result.get('result', {}).get('result', {}).get('value', '')
-                if val == 'ok':
-                    label = f'#{serial}' if serial else f'port {debug_port}'
-                    self._log(f'Chrome profile saved for {label}')
-                    return True
+                return
+            target_infos = result.get('result', {}).get('targetInfos', [])
+            for t in target_infos:
+                t_url = t.get('url', '')
+                tid = t.get('targetId', '')
+                if 'signin' in t_url.lower() and tid not in clicked_targets:
+                    # Attach to target and click
+                    ws.send(json.dumps({
+                        'id': 2,
+                        'method': 'Target.attachToTarget',
+                        'params': {'targetId': tid, 'flatten': True}
+                    }))
+                    attach = self._cdp_read_response(ws, 2)
+                    if not attach:
+                        continue
+                    sid = attach.get('result', {}).get('sessionId', '')
+                    if not sid:
+                        continue
+                    ws.send(json.dumps({
+                        'id': 3,
+                        'sessionId': sid,
+                        'method': 'Runtime.evaluate',
+                        'params': {
+                            'expression': '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}return"nf"})()'
+                        }
+                    }))
+                    ev = self._cdp_read_response(ws, 3)
+                    if ev:
+                        val = ev.get('result', {}).get('result', {}).get('value', '')
+                        if val == 'ok':
+                            clicked_targets.add(tid)
+                            self._log(f'Chrome profile saved for {label}')
+                    break
+            ws.close()
         except Exception:
             pass
-        return False
+
+    def _cdp_click_accept(self, ws_url):
+        """Connect to a target WebSocket and click #accept-button."""
+        try:
+            ws = _ws_mod.create_connection(ws_url, timeout=3)
+            ws.send(json.dumps({
+                'id': 1,
+                'method': 'Runtime.evaluate',
+                'params': {
+                    'expression': '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}return"nf"})()'
+                }
+            }))
+            result = json.loads(ws.recv())
+            ws.close()
+            return result.get('result', {}).get('result', {}).get('value', '') == 'ok'
+        except Exception:
+            return False
+
+    def _cdp_read_response(self, ws, msg_id):
+        """Read WebSocket messages until we get the response matching msg_id."""
+        for _ in range(10):
+            try:
+                msg = json.loads(ws.recv())
+                if msg.get('id') == msg_id:
+                    return msg
+            except Exception:
+                return None
+        return None
 
     # ── Debug Log ─────────────────────────────────────────────────────────────
 
