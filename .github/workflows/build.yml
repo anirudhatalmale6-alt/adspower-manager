@@ -35,8 +35,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v5.13
-          name: APM v5.13
+          tag_name: v5.14
+          name: APM v5.14
           files: |
             dist/APM.exe
             dist/config.ini

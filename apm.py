@@ -200,7 +200,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.13"
+VERSION = "5.14"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2697,6 +2697,76 @@ class APMApp:
         self.root.mainloop()
 
 
+# ─── Self-Install ─────────────────────────────────────────────────────────────
+
+INSTALL_DIR = os.path.join(os.path.expanduser('~'), 'APM')
+
+def _self_install():
+    """If running from outside install dir, install APM to ~/APM/ and relaunch."""
+    if getattr(sys, 'frozen', False):
+        exe_path = os.path.abspath(sys.executable)
+    else:
+        return False
+
+    exe_dir = os.path.dirname(exe_path)
+    if os.path.normcase(os.path.normpath(exe_dir)) == os.path.normcase(os.path.normpath(INSTALL_DIR)):
+        return False
+
+    root = tk.Tk()
+    root.withdraw()
+    answer = messagebox.askyesno('APM Installer',
+        f'Install APM v{VERSION} to:\n{INSTALL_DIR}\n\n'
+        'This will replace the old version.\nYour settings (config.ini) will be preserved.')
+    if not answer:
+        root.destroy()
+        return False
+    root.destroy()
+
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+
+    config_backup = None
+    old_config = os.path.join(INSTALL_DIR, 'config.ini')
+    if os.path.exists(old_config):
+        with open(old_config, 'r') as f:
+            config_backup = f.read()
+
+    for fname in os.listdir(INSTALL_DIR):
+        fpath = os.path.join(INSTALL_DIR, fname)
+        if os.path.isfile(fpath) and fname.lower() != 'config.ini':
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+
+    import shutil
+    shutil.copy2(exe_path, os.path.join(INSTALL_DIR, 'APM.exe'))
+
+    src_config = os.path.join(exe_dir, 'config.ini')
+    if config_backup:
+        with open(old_config, 'w') as f:
+            f.write(config_backup)
+    elif os.path.exists(src_config):
+        shutil.copy2(src_config, old_config)
+
+    try:
+        desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        vbs = os.path.join(INSTALL_DIR, '_mkshortcut.vbs')
+        target = os.path.join(INSTALL_DIR, 'APM.exe')
+        shortcut = os.path.join(desktop, 'APM.lnk')
+        with open(vbs, 'w') as f:
+            f.write(f'Set s=CreateObject("WScript.Shell").CreateShortcut("{shortcut}")\n')
+            f.write(f's.TargetPath="{target}"\n')
+            f.write(f's.WorkingDirectory="{INSTALL_DIR}"\n')
+            f.write('s.Save\n')
+        subprocess.run(['cscript', '//nologo', vbs], timeout=10)
+        os.remove(vbs)
+    except Exception:
+        pass
+
+    subprocess.Popen([os.path.join(INSTALL_DIR, 'APM.exe')])
+    sys.exit(0)
+
+
 # ─── Entry ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -2705,6 +2775,8 @@ if __name__ == '__main__':
         root.withdraw()
         messagebox.showerror('APM', 'Missing "requests" package.\npip install requests')
         sys.exit(1)
+
+    _self_install()
 
     app = APMApp()
     app.run()
