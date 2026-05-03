@@ -200,7 +200,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.11"
+VERSION = "5.12"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2555,30 +2555,34 @@ class APMApp:
             self._log(f'[PS] Browser WS error: {e}')
 
     _CLICK_JS = ('(function(){'
-        'var sels=["dice-web-signin-intercept-app","signin-dice-web-intercept-app",'
-        '"dice-web-signin-intercept","cr-view-manager"];'
-        'for(var i=0;i<sels.length;i++){'
-        'var el=document.querySelector(sels[i]);'
-        'if(el&&el.shadowRoot){'
-        'var b=el.shadowRoot.querySelector("#acceptButton")'
-        '||el.shadowRoot.querySelector("#accept-button")'
-        '||el.shadowRoot.querySelector(".action-button")'
-        '||el.shadowRoot.querySelector("cr-button");'
-        'if(b){b.click();return"ok"}'
-        'var kids=el.shadowRoot.querySelectorAll("*");'
-        'for(var j=0;j<kids.length;j++){'
-        'if(kids[j].shadowRoot){'
-        'var b2=kids[j].shadowRoot.querySelector("#acceptButton")'
-        '||kids[j].shadowRoot.querySelector(".action-button");'
-        'if(b2){b2.click();return"ok"}}}}}'
-        'var d=document.querySelector("#acceptButton")'
-        '||document.querySelector("#accept-button");'
-        'if(d){d.click();return"ok"}'
-        'var tags=[];var ch=document.body?document.body.children:[];'
-        'for(var k=0;k<ch.length&&k<10;k++)'
-        'tags.push(ch[k].tagName+(ch[k].shadowRoot?"[SR]":""));'
-        'return"nf:"+tags.join(",")+"||"'
-        '+(document.body?document.body.innerHTML.substring(0,200):"")'
+        'function findBtn(root){'
+        'if(!root)return null;'
+        'var b=root.querySelector("#acceptButton")'
+        '||root.querySelector("#accept-button")'
+        '||root.querySelector(".action-button")'
+        '||root.querySelector("cr-button")'
+        '||root.querySelector("button");'
+        'if(b)return b;'
+        'var els=root.querySelectorAll("*");'
+        'for(var i=0;i<els.length;i++){'
+        'if(els[i].shadowRoot){'
+        'var found=findBtn(els[i].shadowRoot);'
+        'if(found)return found}}'
+        'return null}'
+        'var app=document.querySelector("chrome-signin-app")'
+        '||document.querySelector("dice-web-signin-intercept-app");'
+        'if(app&&app.shadowRoot){'
+        'var btn=findBtn(app.shadowRoot);'
+        'if(btn){btn.click();return"ok"}}'
+        'var all=document.querySelectorAll("*");'
+        'for(var k=0;k<all.length;k++){'
+        'if(all[k].shadowRoot){'
+        'var btn2=findBtn(all[k].shadowRoot);'
+        'if(btn2){btn2.click();return"ok"}}}'
+        'var btn3=findBtn(document);'
+        'if(btn3){btn3.click();return"ok"}'
+        'var sr=app&&app.shadowRoot?app.shadowRoot.innerHTML.substring(0,500):"no-sr";'
+        'return"nf:"+sr'
         '})()')
 
     def _cdp_attach_and_click(self, ws, target_id, base_id):
