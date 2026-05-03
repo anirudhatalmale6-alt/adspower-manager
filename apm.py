@@ -200,7 +200,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.10"
+VERSION = "5.11"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2554,8 +2554,35 @@ class APMApp:
         except Exception as e:
             self._log(f'[PS] Browser WS error: {e}')
 
+    _CLICK_JS = ('(function(){'
+        'var sels=["dice-web-signin-intercept-app","signin-dice-web-intercept-app",'
+        '"dice-web-signin-intercept","cr-view-manager"];'
+        'for(var i=0;i<sels.length;i++){'
+        'var el=document.querySelector(sels[i]);'
+        'if(el&&el.shadowRoot){'
+        'var b=el.shadowRoot.querySelector("#acceptButton")'
+        '||el.shadowRoot.querySelector("#accept-button")'
+        '||el.shadowRoot.querySelector(".action-button")'
+        '||el.shadowRoot.querySelector("cr-button");'
+        'if(b){b.click();return"ok"}'
+        'var kids=el.shadowRoot.querySelectorAll("*");'
+        'for(var j=0;j<kids.length;j++){'
+        'if(kids[j].shadowRoot){'
+        'var b2=kids[j].shadowRoot.querySelector("#acceptButton")'
+        '||kids[j].shadowRoot.querySelector(".action-button");'
+        'if(b2){b2.click();return"ok"}}}}}'
+        'var d=document.querySelector("#acceptButton")'
+        '||document.querySelector("#accept-button");'
+        'if(d){d.click();return"ok"}'
+        'var tags=[];var ch=document.body?document.body.children:[];'
+        'for(var k=0;k<ch.length&&k<10;k++)'
+        'tags.push(ch[k].tagName+(ch[k].shadowRoot?"[SR]":""));'
+        'return"nf:"+tags.join(",")+"||"'
+        '+(document.body?document.body.innerHTML.substring(0,200):"")'
+        '})()')
+
     def _cdp_attach_and_click(self, ws, target_id, base_id):
-        """Attach to target via browser WS session and click #accept-button."""
+        """Attach to target via browser WS session and click accept button (Shadow DOM aware)."""
         try:
             ws.send(json.dumps({
                 'id': base_id,
@@ -2574,12 +2601,11 @@ class APMApp:
                 self._log(f'[PS] attach: no sessionId, resp={str(attach)[:200]}')
                 return False
             self._log(f'[PS] attached session={sid[:20]}')
-            js = '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}var all=document.querySelectorAll("button");var names=[];for(var i=0;i<all.length;i++)names.push(all[i].id+":"+all[i].textContent.substring(0,30));return"nf:"+names.join(",")})()'
             ws.send(json.dumps({
                 'id': base_id + 1,
                 'sessionId': sid,
                 'method': 'Runtime.evaluate',
-                'params': {'expression': js}
+                'params': {'expression': self._CLICK_JS}
             }))
             ev = self._cdp_read_response(ws, base_id + 1)
             if not ev:
@@ -2589,14 +2615,14 @@ class APMApp:
                 self._log(f'[PS] evaluate error: {ev["error"]}')
                 return False
             val = ev.get('result', {}).get('result', {}).get('value', '')
-            self._log(f'[PS] click result: {val[:100]}')
+            self._log(f'[PS] click result: {val[:200]}')
             return val == 'ok'
         except Exception as e:
             self._log(f'[PS] attach+click error: {e}')
             return False
 
     def _cdp_click_accept_raw(self, port, ws_url):
-        """Connect to target via raw WebSocket (no Origin) and click. Returns (success, detail)."""
+        """Connect to target via raw WebSocket and click. Returns (success, detail)."""
         path = '/' + ws_url.replace('ws://', '').split('/', 1)[-1]
         try:
             ws = _RawWS('127.0.0.1', port, path, timeout=3)
@@ -2606,9 +2632,7 @@ class APMApp:
             ws.send(json.dumps({
                 'id': 1,
                 'method': 'Runtime.evaluate',
-                'params': {
-                    'expression': '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}return"nf"})()'
-                }
+                'params': {'expression': self._CLICK_JS}
             }))
             raw = ws.recv()
             ws.close()
