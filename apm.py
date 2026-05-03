@@ -109,7 +109,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.9"
+VERSION = "5.4"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2336,12 +2336,17 @@ class APMApp:
         """Auto-click 'Continue as' button via Chrome DevTools Protocol."""
         clicked_targets = set()
         port_cache = {}  # pid -> debug_port
+        scan_count = 0
         while self.running:
             if not self.opt_profile_saver.get():
                 time.sleep(3)
                 continue
+            scan_count += 1
+            verbose = scan_count <= 3 or scan_count % 60 == 0
             try:
                 sun_pids = {p for p, v in self.sunpid_cache.items() if v}
+                if verbose:
+                    self._log(f'[PS] Scanning {len(sun_pids)} SunBrowser PID(s)')
                 for pid in sun_pids:
                     if pid in port_cache:
                         port = port_cache[pid]
@@ -2349,22 +2354,26 @@ class APMApp:
                         cmdline = self.cmdline_cache.get(pid, '')
                         if not cmdline:
                             cmdline = get_process_cmdline(pid)
+                        if verbose and cmdline:
+                            port_part = re.search(r'--remote-debugging-port=\d+', cmdline)
+                            self._log(f'[PS] PID {pid}: port={port_part.group(0) if port_part else "NOT FOUND"}')
                         m = re.search(r'--remote-debugging-port=(\d+)', cmdline)
                         if not m:
                             continue
                         port = int(m.group(1))
                         port_cache[pid] = port
                     profile = self.pid_profile_cache.get(pid, f'PID:{pid}')
-                    self._try_click_signin(port, profile, clicked_targets)
-            except Exception:
-                pass
+                    self._try_click_signin(port, profile, clicked_targets, verbose)
+            except Exception as e:
+                if verbose:
+                    self._log(f'[PS] Error: {e}')
             if len(clicked_targets) > 1000:
                 clicked_targets.clear()
             if len(port_cache) > 500:
                 port_cache.clear()
             time.sleep(5)
 
-    def _try_click_signin(self, debug_port, serial, clicked_targets):
+    def _try_click_signin(self, debug_port, serial, clicked_targets, verbose=False):
         """Check browser for signin popup and click accept via CDP."""
         label = f'#{serial}' if serial else f'port {debug_port}'
         try:
@@ -2373,11 +2382,16 @@ class APMApp:
             req = Request(url)
             with urlopen(req, timeout=2) as r:
                 targets = json.loads(r.read().decode())
+            if verbose:
+                urls = [t.get('url', '')[:60] for t in targets]
+                self._log(f'[PS] Port {debug_port}: {len(targets)} targets: {urls}')
             for target in targets:
                 t_url = target.get('url', '')
                 tid = target.get('id', '')
                 if 'signin' in t_url.lower() and tid not in clicked_targets:
                     ws_url = target.get('webSocketDebuggerUrl', '')
+                    if verbose:
+                        self._log(f'[PS] Found signin target: {t_url[:80]}')
                     if ws_url and self._cdp_click_accept(ws_url):
                         clicked_targets.add(tid)
                         self._log(f'Chrome profile saved for {label}')
@@ -2398,6 +2412,9 @@ class APMApp:
                 ws.close()
                 return
             target_infos = result.get('result', {}).get('targetInfos', [])
+            if verbose:
+                m2_urls = [f'{t.get("type","?")}:{t.get("url","")[:50]}' for t in target_infos]
+                self._log(f'[PS] Method2 port {debug_port}: {len(target_infos)} targets: {m2_urls}')
             for t in target_infos:
                 t_url = t.get('url', '')
                 tid = t.get('targetId', '')
