@@ -1109,6 +1109,12 @@ class APMApp:
             row=row, column=0, columnspan=2, sticky='w', padx=12)
         row += 1
 
+        self.opt_profile_saver = tk.BooleanVar(value=self.cfg.get('MAIN', 'AutoProfileSaver', fallback='0') == '1')
+        tk.Checkbutton(inner, text='Auto-save Chrome profile (click "Continue as" popup)',
+                        variable=self.opt_profile_saver).grid(
+            row=row, column=0, columnspan=2, sticky='w', padx=12)
+        row += 1
+
         self.opt_custom_nav = tk.BooleanVar(value=self.cfg.get('MAIN', 'CustomNavSize') == '1')
         cb_frame = tk.Frame(inner)
         cb_frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=12)
@@ -2227,6 +2233,7 @@ class APMApp:
         self.cfg.set('MAIN', 'AutoSorting', '1' if self.opt_autosorting.get() else '0')
         self.cfg.set('MAIN', 'InjectControls', '1' if self.opt_inject.get() else '0')
         self.cfg.set('MAIN', 'MinimizeOthers', '1' if self.opt_minimize_others.get() else '0')
+        self.cfg.set('MAIN', 'AutoProfileSaver', '1' if self.opt_profile_saver.get() else '0')
         self.cfg.set('MAIN', 'CustomNavSize', '1' if self.opt_custom_nav.get() else '0')
         self.cfg.set('MAIN', 'NavWidth', self.set_navw.get())
         self.cfg.set('MAIN', 'NavHeight', self.set_navh.get())
@@ -2320,14 +2327,18 @@ class APMApp:
 
         if HAS_WS:
             threading.Thread(target=self._chrome_profile_monitor, daemon=True).start()
-            self._log('Chrome profile auto-saver started')
+            if self.cfg.get('MAIN', 'AutoProfileSaver', fallback='0') == '1':
+                self._log('Chrome profile auto-saver is ON')
         else:
-            self._log('websocket-client not installed, Chrome profile auto-saver disabled')
+            self._log('websocket-client not installed, Chrome profile auto-saver unavailable')
 
     def _chrome_profile_monitor(self):
         """Auto-click 'Continue as' button via Chrome DevTools Protocol."""
         clicked_ports = set()
         while self.running:
+            if not self.opt_profile_saver.get():
+                time.sleep(3)
+                continue
             try:
                 for base in self.api.bases:
                     try:
