@@ -109,7 +109,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.8"
+VERSION = "5.9"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2435,7 +2435,7 @@ class APMApp:
                 if verbose:
                     self._log(f'[PS] No browser WS for port {debug_port}')
                 return
-            ws = _ws_mod.create_connection(browser_ws, timeout=5)
+            ws = _ws_mod.create_connection(browser_ws, timeout=5, suppress_origin=True)
             if found_tid and found_tid not in clicked_targets:
                 self._log(f'[PS] M2 attach to known target {found_tid[:16]}')
                 ok = self._cdp_attach_and_click(ws, found_tid, 2)
@@ -2511,7 +2511,7 @@ class APMApp:
     def _cdp_click_accept(self, ws_url):
         """Connect to a target WebSocket and click #accept-button. Returns (success, detail)."""
         try:
-            ws = _ws_mod.create_connection(ws_url, timeout=3)
+            ws = _ws_mod.create_connection(ws_url, timeout=3, suppress_origin=True)
         except Exception as e:
             return False, f'WS connect failed: {e}'
         try:
