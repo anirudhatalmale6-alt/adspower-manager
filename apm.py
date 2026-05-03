@@ -200,7 +200,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.12"
+VERSION = "5.13"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2452,7 +2452,7 @@ class APMApp:
                 clicked_targets.clear()
             if len(port_cache) > 500:
                 port_cache.clear()
-            time.sleep(5)
+            time.sleep(2)
 
     def _get_debug_port(self, pid, verbose=False):
         """Get the actual debug port for a SunBrowser process."""
