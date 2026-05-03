@@ -29,10 +29,10 @@ except ImportError:
     requests = None
 
 try:
-    import uiautomation as auto
-    HAS_UIA = True
+    import websocket as _ws_mod
+    HAS_WS = True
 except ImportError:
-    HAS_UIA = False
+    HAS_WS = False
 
 # Windows API with proper 64-bit type declarations
 try:
@@ -2318,37 +2318,79 @@ class APMApp:
                 time.sleep(30)
         threading.Thread(target=cache_loop, daemon=True).start()
 
-        if HAS_UIA:
+        if HAS_WS:
             threading.Thread(target=self._chrome_profile_monitor, daemon=True).start()
             self._log('Chrome profile auto-saver started')
         else:
-            self._log('uiautomation not installed, Chrome profile auto-saver disabled')
+            self._log('websocket-client not installed, Chrome profile auto-saver disabled')
 
     def _chrome_profile_monitor(self):
-        """Auto-click 'Continue as' button when SunBrowser profile save popup appears."""
+        """Auto-click 'Continue as' button via Chrome DevTools Protocol."""
+        clicked_ports = set()
         while self.running:
             try:
-                desktop = auto.GetRootControl()
-                windows = desktop.GetChildren()
-                for win in windows:
+                for base in self.api.bases:
                     try:
-                        if win.ClassName != 'Chrome_WidgetWin_1':
+                        resp_data = self.api._get('/api/v1/browser/active?page=1&page_size=200')
+                        if not resp_data or resp_data.get('code') != 0:
                             continue
-                        btn = win.ButtonControl(
-                            searchDepth=8,
-                            FoundIndex=1,
-                            RegexName=r'(?i)continue\s+as\s+.*'
-                        )
-                        if btn.Exists(maxSearchSeconds=0.1):
-                            name = btn.Name
-                            btn.Click(simulateMove=False)
-                            self._log(f'Chrome profile saved: clicked "{name}"')
-                            time.sleep(3)
+                        data = resp_data.get('data', {})
+                        browsers = data.get('list', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                        for b in browsers:
+                            ws_info = b.get('ws', {}) if isinstance(b.get('ws'), dict) else {}
+                            selenium = ws_info.get('selenium', '') or str(b.get('debug_port', ''))
+                            if not selenium:
+                                continue
+                            m = re.search(r':(\d+)', str(selenium))
+                            if not m:
+                                continue
+                            port = int(m.group(1))
+                            if port in clicked_ports:
+                                continue
+                            serial = str(b.get('serial_number', '') or '').strip()
+                            if self._try_click_signin(port, serial):
+                                clicked_ports.add(port)
+                        break
                     except Exception:
                         pass
+                if len(clicked_ports) > 500:
+                    clicked_ports.clear()
             except Exception:
                 pass
-            time.sleep(3)
+            time.sleep(5)
+
+    def _try_click_signin(self, debug_port, serial):
+        """Check browser for signin popup and click accept via CDP."""
+        try:
+            url = f'http://127.0.0.1:{debug_port}/json'
+            req = Request(url)
+            with urlopen(req, timeout=2) as r:
+                targets = json.loads(r.read().decode())
+            for target in targets:
+                if 'signin-dice-web-intercept' not in target.get('url', ''):
+                    continue
+                ws_url = target.get('webSocketDebuggerUrl', '')
+                if not ws_url:
+                    continue
+                ws = _ws_mod.create_connection(ws_url, timeout=3)
+                cmd = json.dumps({
+                    'id': 1,
+                    'method': 'Runtime.evaluate',
+                    'params': {
+                        'expression': '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return "ok"}return "nf"})()'
+                    }
+                })
+                ws.send(cmd)
+                result = json.loads(ws.recv())
+                ws.close()
+                val = result.get('result', {}).get('result', {}).get('value', '')
+                if val == 'ok':
+                    label = f'#{serial}' if serial else f'port {debug_port}'
+                    self._log(f'Chrome profile saved for {label}')
+                    return True
+        except Exception:
+            pass
+        return False
 
     # ── Debug Log ─────────────────────────────────────────────────────────────
 

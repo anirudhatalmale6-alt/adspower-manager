@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests websocket-client keyboard pywin32 Pillow pyinstaller uiautomation
+          pip install requests websocket-client keyboard pywin32 Pillow pyinstaller
 
       - name: Build EXE
         run: |
@@ -35,8 +35,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v5.0
-          name: APM v5.0
+          tag_name: v5.1
+          name: APM v5.1
           files: |
             dist/APM.exe
             dist/config.ini
