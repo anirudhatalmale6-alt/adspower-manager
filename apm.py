@@ -109,7 +109,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.4"
+VERSION = "5.6"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -1109,7 +1109,7 @@ class APMApp:
             row=row, column=0, columnspan=2, sticky='w', padx=12)
         row += 1
 
-        self.opt_profile_saver = tk.BooleanVar(value=self.cfg.get('MAIN', 'AutoProfileSaver', fallback='0') == '1')
+        self.opt_profile_saver = tk.BooleanVar(value=self.cfg.get('MAIN', 'AutoProfileSaver', fallback='1') == '1')
         tk.Checkbutton(inner, text='Auto-save Chrome profile (click "Continue as" popup)',
                         variable=self.opt_profile_saver).grid(
             row=row, column=0, columnspan=2, sticky='w', padx=12)
@@ -2351,16 +2351,9 @@ class APMApp:
                     if pid in port_cache:
                         port = port_cache[pid]
                     else:
-                        cmdline = self.cmdline_cache.get(pid, '')
-                        if not cmdline:
-                            cmdline = get_process_cmdline(pid)
-                        if verbose and cmdline:
-                            port_part = re.search(r'--remote-debugging-port=\d+', cmdline)
-                            self._log(f'[PS] PID {pid}: port={port_part.group(0) if port_part else "NOT FOUND"}')
-                        m = re.search(r'--remote-debugging-port=(\d+)', cmdline)
-                        if not m:
+                        port = self._get_debug_port(pid, verbose)
+                        if not port:
                             continue
-                        port = int(m.group(1))
                         port_cache[pid] = port
                     profile = self.pid_profile_cache.get(pid, f'PID:{pid}')
                     self._try_click_signin(port, profile, clicked_targets, verbose)
@@ -2372,6 +2365,35 @@ class APMApp:
             if len(port_cache) > 500:
                 port_cache.clear()
             time.sleep(5)
+
+    def _get_debug_port(self, pid, verbose=False):
+        """Get the actual debug port for a SunBrowser process."""
+        cmdline = self.cmdline_cache.get(pid, '')
+        if not cmdline:
+            cmdline = get_process_cmdline(pid)
+        # Try command line first (works if port != 0)
+        m = re.search(r'--remote-debugging-port=(\d+)', cmdline)
+        if m and int(m.group(1)) > 0:
+            return int(m.group(1))
+        # Port is 0 (random) - get from API using user_id
+        user_id = get_adspower_userid_from_cmdline(cmdline)
+        if not user_id:
+            if verbose:
+                self._log(f'[PS] PID {pid}: no user_id in cmdline')
+            return 0
+        resp = self.api._get(self.api._api_path(f'/api/v1/browser/active?user_id={user_id}'))
+        if not resp or resp.get('code') != 0:
+            if verbose:
+                self._log(f'[PS] PID {pid} uid={user_id}: API error: {resp}')
+            return 0
+        data = resp.get('data', {})
+        ws_info = data.get('ws', {}) if isinstance(data.get('ws'), dict) else {}
+        selenium = ws_info.get('selenium', '') or str(data.get('debug_port', ''))
+        m2 = re.search(r':(\d+)', str(selenium))
+        port = int(m2.group(1)) if m2 else 0
+        if verbose:
+            self._log(f'[PS] PID {pid} uid={user_id}: debug_port={port}')
+        return port
 
     def _try_click_signin(self, debug_port, serial, clicked_targets, verbose=False):
         """Check browser for signin popup and click accept via CDP."""
