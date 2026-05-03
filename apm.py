@@ -109,7 +109,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.7"
+VERSION = "5.8"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2398,8 +2398,8 @@ class APMApp:
     def _try_click_signin(self, debug_port, serial, clicked_targets, verbose=False):
         """Check browser for signin popup and click accept via CDP."""
         label = f'#{serial}' if serial else f'port {debug_port}'
+        found_tid = None
         try:
-            # Method 1: Direct target list - check /json for signin-dice-web-intercept
             url = f'http://127.0.0.1:{debug_port}/json'
             req = Request(url)
             with urlopen(req, timeout=2) as r:
@@ -2409,14 +2409,23 @@ class APMApp:
                 tid = target.get('id', '')
                 if 'signin-dice-web-intercept' in t_url and tid not in clicked_targets:
                     ws_url = target.get('webSocketDebuggerUrl', '')
-                    if verbose:
-                        self._log(f'[PS] M1 found bubble: {t_url[:80]}')
-                    if ws_url and self._cdp_click_accept(ws_url):
-                        clicked_targets.add(tid)
-                        self._log(f'Chrome profile saved for {label}')
-                        return
+                    self._log(f'[PS] Found bubble for {label}: {t_url[:80]}')
+                    self._log(f'[PS] WS URL: {ws_url[:100] if ws_url else "NONE"}')
+                    found_tid = tid
+                    if ws_url:
+                        ok, detail = self._cdp_click_accept(ws_url)
+                        if ok:
+                            clicked_targets.add(tid)
+                            self._log(f'Chrome profile saved for {label} (direct)')
+                            return
+                        else:
+                            self._log(f'[PS] Direct WS failed: {detail}')
+                    break
+        except Exception as e:
+            if verbose:
+                self._log(f'[PS] /json scan error: {e}')
 
-            # Method 2: Browser-level CDP to find top-chrome WebUI targets
+        try:
             url2 = f'http://127.0.0.1:{debug_port}/json/version'
             req2 = Request(url2)
             with urlopen(req2, timeout=2) as r2:
@@ -2424,57 +2433,88 @@ class APMApp:
             browser_ws = ver.get('webSocketDebuggerUrl', '')
             if not browser_ws:
                 if verbose:
-                    self._log(f'[PS] Port {debug_port}: no browser WS URL')
+                    self._log(f'[PS] No browser WS for port {debug_port}')
                 return
             ws = _ws_mod.create_connection(browser_ws, timeout=5)
-            ws.send(json.dumps({'id': 1, 'method': 'Target.getTargets'}))
-            result = self._cdp_read_response(ws, 1)
+            if found_tid and found_tid not in clicked_targets:
+                self._log(f'[PS] M2 attach to known target {found_tid[:16]}')
+                ok = self._cdp_attach_and_click(ws, found_tid, 2)
+                if ok:
+                    clicked_targets.add(found_tid)
+                    self._log(f'Chrome profile saved for {label} (M2-direct)')
+                    ws.close()
+                    return
+
+            ws.send(json.dumps({'id': 10, 'method': 'Target.getTargets'}))
+            result = self._cdp_read_response(ws, 10)
             if not result:
+                self._log(f'[PS] M2 getTargets returned nothing')
                 ws.close()
                 return
             target_infos = result.get('result', {}).get('targetInfos', [])
-            if verbose:
-                m2_urls = [f'{t.get("type","?")}:{t.get("url","")[:50]}' for t in target_infos]
-                self._log(f'[PS] M2 port {debug_port}: {len(target_infos)} targets: {m2_urls}')
+            self._log(f'[PS] M2 found {len(target_infos)} targets')
             for t in target_infos:
                 t_url = t.get('url', '')
                 tid = t.get('targetId', '')
                 if 'signin-dice-web-intercept' in t_url and tid not in clicked_targets:
-                    # Attach to target and click
-                    ws.send(json.dumps({
-                        'id': 2,
-                        'method': 'Target.attachToTarget',
-                        'params': {'targetId': tid, 'flatten': True}
-                    }))
-                    attach = self._cdp_read_response(ws, 2)
-                    if not attach:
-                        continue
-                    sid = attach.get('result', {}).get('sessionId', '')
-                    if not sid:
-                        continue
-                    ws.send(json.dumps({
-                        'id': 3,
-                        'sessionId': sid,
-                        'method': 'Runtime.evaluate',
-                        'params': {
-                            'expression': '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}return"nf"})()'
-                        }
-                    }))
-                    ev = self._cdp_read_response(ws, 3)
-                    if ev:
-                        val = ev.get('result', {}).get('result', {}).get('value', '')
-                        if val == 'ok':
-                            clicked_targets.add(tid)
-                            self._log(f'Chrome profile saved for {label}')
+                    self._log(f'[PS] M2 bubble: {t_url[:80]} tid={tid[:16]}')
+                    ok = self._cdp_attach_and_click(ws, tid, 20)
+                    if ok:
+                        clicked_targets.add(tid)
+                        self._log(f'Chrome profile saved for {label} (M2-scan)')
                     break
             ws.close()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log(f'[PS] M2 error: {e}')
+
+    def _cdp_attach_and_click(self, ws, target_id, base_id):
+        """Attach to target via browser WS session and click #accept-button."""
+        try:
+            ws.send(json.dumps({
+                'id': base_id,
+                'method': 'Target.attachToTarget',
+                'params': {'targetId': target_id, 'flatten': True}
+            }))
+            attach = self._cdp_read_response(ws, base_id)
+            if not attach:
+                self._log(f'[PS] attach: no response')
+                return False
+            if 'error' in attach:
+                self._log(f'[PS] attach error: {attach["error"]}')
+                return False
+            sid = attach.get('result', {}).get('sessionId', '')
+            if not sid:
+                self._log(f'[PS] attach: no sessionId, resp={str(attach)[:200]}')
+                return False
+            self._log(f'[PS] attached, session={sid[:20]}')
+            js = '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}var all=document.querySelectorAll("button");var names=[];for(var i=0;i<all.length;i++)names.push(all[i].id+":"+all[i].textContent.substring(0,30));return"nf:"+names.join(",")})()'
+            ws.send(json.dumps({
+                'id': base_id + 1,
+                'sessionId': sid,
+                'method': 'Runtime.evaluate',
+                'params': {'expression': js}
+            }))
+            ev = self._cdp_read_response(ws, base_id + 1)
+            if not ev:
+                self._log(f'[PS] evaluate: no response')
+                return False
+            if 'error' in ev:
+                self._log(f'[PS] evaluate error: {ev["error"]}')
+                return False
+            val = ev.get('result', {}).get('result', {}).get('value', '')
+            self._log(f'[PS] evaluate result: {val[:100]}')
+            return val == 'ok'
+        except Exception as e:
+            self._log(f'[PS] attach+click error: {e}')
+            return False
 
     def _cdp_click_accept(self, ws_url):
-        """Connect to a target WebSocket and click #accept-button."""
+        """Connect to a target WebSocket and click #accept-button. Returns (success, detail)."""
         try:
             ws = _ws_mod.create_connection(ws_url, timeout=3)
+        except Exception as e:
+            return False, f'WS connect failed: {e}'
+        try:
             ws.send(json.dumps({
                 'id': 1,
                 'method': 'Runtime.evaluate',
@@ -2484,9 +2524,18 @@ class APMApp:
             }))
             result = json.loads(ws.recv())
             ws.close()
-            return result.get('result', {}).get('result', {}).get('value', '') == 'ok'
-        except Exception:
-            return False
+            if 'error' in result:
+                return False, f'CDP error: {result["error"]}'
+            val = result.get('result', {}).get('result', {}).get('value', '')
+            if val == 'ok':
+                return True, 'clicked'
+            return False, f'button not found, got: {val}'
+        except Exception as e:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return False, f'eval error: {e}'
 
     def _cdp_read_response(self, ws, msg_id):
         """Read WebSocket messages until we get the response matching msg_id."""
