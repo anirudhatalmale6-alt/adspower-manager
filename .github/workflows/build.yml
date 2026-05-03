@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -29,10 +32,11 @@ jobs:
           copy config.ini dist\
         shell: cmd
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: APM-Windows
-          path: |
+          tag_name: v5.0
+          name: APM v5.0
+          files: |
             dist/APM.exe
             dist/config.ini
