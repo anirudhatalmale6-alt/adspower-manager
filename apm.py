@@ -109,7 +109,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.6"
+VERSION = "5.7"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2399,21 +2399,18 @@ class APMApp:
         """Check browser for signin popup and click accept via CDP."""
         label = f'#{serial}' if serial else f'port {debug_port}'
         try:
-            # Method 1: Direct target list - check /json for signin page
+            # Method 1: Direct target list - check /json for signin-dice-web-intercept
             url = f'http://127.0.0.1:{debug_port}/json'
             req = Request(url)
             with urlopen(req, timeout=2) as r:
                 targets = json.loads(r.read().decode())
-            if verbose:
-                urls = [t.get('url', '')[:60] for t in targets]
-                self._log(f'[PS] Port {debug_port}: {len(targets)} targets: {urls}')
             for target in targets:
                 t_url = target.get('url', '')
                 tid = target.get('id', '')
-                if 'signin' in t_url.lower() and tid not in clicked_targets:
+                if 'signin-dice-web-intercept' in t_url and tid not in clicked_targets:
                     ws_url = target.get('webSocketDebuggerUrl', '')
                     if verbose:
-                        self._log(f'[PS] Found signin target: {t_url[:80]}')
+                        self._log(f'[PS] M1 found bubble: {t_url[:80]}')
                     if ws_url and self._cdp_click_accept(ws_url):
                         clicked_targets.add(tid)
                         self._log(f'Chrome profile saved for {label}')
@@ -2423,9 +2420,11 @@ class APMApp:
             url2 = f'http://127.0.0.1:{debug_port}/json/version'
             req2 = Request(url2)
             with urlopen(req2, timeout=2) as r2:
-                version = json.loads(r2.read().decode())
-            browser_ws = version.get('webSocketDebuggerUrl', '')
+                ver = json.loads(r2.read().decode())
+            browser_ws = ver.get('webSocketDebuggerUrl', '')
             if not browser_ws:
+                if verbose:
+                    self._log(f'[PS] Port {debug_port}: no browser WS URL')
                 return
             ws = _ws_mod.create_connection(browser_ws, timeout=5)
             ws.send(json.dumps({'id': 1, 'method': 'Target.getTargets'}))
@@ -2436,11 +2435,11 @@ class APMApp:
             target_infos = result.get('result', {}).get('targetInfos', [])
             if verbose:
                 m2_urls = [f'{t.get("type","?")}:{t.get("url","")[:50]}' for t in target_infos]
-                self._log(f'[PS] Method2 port {debug_port}: {len(target_infos)} targets: {m2_urls}')
+                self._log(f'[PS] M2 port {debug_port}: {len(target_infos)} targets: {m2_urls}')
             for t in target_infos:
                 t_url = t.get('url', '')
                 tid = t.get('targetId', '')
-                if 'signin' in t_url.lower() and tid not in clicked_targets:
+                if 'signin-dice-web-intercept' in t_url and tid not in clicked_targets:
                     # Attach to target and click
                     ws.send(json.dumps({
                         'id': 2,
