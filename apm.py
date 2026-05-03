@@ -2335,39 +2335,33 @@ class APMApp:
     def _chrome_profile_monitor(self):
         """Auto-click 'Continue as' button via Chrome DevTools Protocol."""
         clicked_targets = set()
-        first_scan = True
+        port_cache = {}  # pid -> debug_port
         while self.running:
             if not self.opt_profile_saver.get():
                 time.sleep(3)
                 continue
             try:
-                resp_data = self.api._get('/api/v1/browser/active?page=1&page_size=200')
-                if not resp_data or resp_data.get('code') != 0:
-                    if first_scan:
-                        self._log(f'[ProfileSaver] API returned: {resp_data}')
-                        first_scan = False
-                    time.sleep(5)
-                    continue
-                data = resp_data.get('data', {})
-                browsers = data.get('list', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                if first_scan:
-                    self._log(f'[ProfileSaver] Found {len(browsers)} active browser(s)')
-                    first_scan = False
-                for b in browsers:
-                    ws_info = b.get('ws', {}) if isinstance(b.get('ws'), dict) else {}
-                    selenium = ws_info.get('selenium', '') or str(b.get('debug_port', ''))
-                    if not selenium:
-                        continue
-                    m = re.search(r':(\d+)', str(selenium))
-                    if not m:
-                        continue
-                    port = int(m.group(1))
-                    serial = str(b.get('serial_number', '') or '').strip()
-                    self._try_click_signin(port, serial, clicked_targets)
-            except Exception as e:
-                self._log(f'[ProfileSaver] Error: {e}')
+                sun_pids = {p for p, v in self.sunpid_cache.items() if v}
+                for pid in sun_pids:
+                    if pid in port_cache:
+                        port = port_cache[pid]
+                    else:
+                        cmdline = self.cmdline_cache.get(pid, '')
+                        if not cmdline:
+                            cmdline = get_process_cmdline(pid)
+                        m = re.search(r'--remote-debugging-port=(\d+)', cmdline)
+                        if not m:
+                            continue
+                        port = int(m.group(1))
+                        port_cache[pid] = port
+                    profile = self.pid_profile_cache.get(pid, f'PID:{pid}')
+                    self._try_click_signin(port, profile, clicked_targets)
+            except Exception:
+                pass
             if len(clicked_targets) > 1000:
                 clicked_targets.clear()
+            if len(port_cache) > 500:
+                port_cache.clear()
             time.sleep(5)
 
     def _try_click_signin(self, debug_port, serial, clicked_targets):
