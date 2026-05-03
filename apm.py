@@ -34,6 +34,97 @@ try:
 except ImportError:
     HAS_WS = False
 
+import socket as _socket_mod
+import base64 as _b64_mod
+
+
+class _RawWS:
+    """Minimal WebSocket client using raw sockets. No Origin header sent."""
+
+    def __init__(self, host, port, path, timeout=5):
+        self.sock = _socket_mod.create_connection((host, int(port)), timeout=timeout)
+        key = _b64_mod.b64encode(os.urandom(16)).decode()
+        req = (f'GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n'
+               f'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+               f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
+        self.sock.sendall(req.encode())
+        resp = b''
+        while b'\r\n\r\n' not in resp:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise Exception('closed during handshake')
+            resp += chunk
+        status = resp.split(b'\r\n')[0].decode()
+        if '101' not in status:
+            self.sock.close()
+            raise Exception(f'WS handshake rejected: {status}')
+
+    @classmethod
+    def from_url(cls, url, timeout=5):
+        url = url.replace('ws://', '').replace('wss://', '')
+        host_port, _, path = url.partition('/')
+        host, _, port = host_port.partition(':')
+        return cls(host, int(port or 80), '/' + path, timeout)
+
+    def send(self, data):
+        if isinstance(data, str):
+            data = data.encode()
+        mask = os.urandom(4)
+        frame = bytearray([0x81])
+        ln = len(data)
+        if ln < 126:
+            frame.append(0x80 | ln)
+        elif ln < 65536:
+            frame.append(0x80 | 126)
+            frame += struct.pack('>H', ln)
+        else:
+            frame.append(0x80 | 127)
+            frame += struct.pack('>Q', ln)
+        frame += mask
+        frame += bytearray(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(frame)
+
+    def recv(self):
+        h = self._readn(2)
+        if not h:
+            return None
+        op = h[0] & 0x0F
+        masked = bool(h[1] & 0x80)
+        ln = h[1] & 0x7F
+        if ln == 126:
+            ln = struct.unpack('>H', self._readn(2))[0]
+        elif ln == 127:
+            ln = struct.unpack('>Q', self._readn(8))[0]
+        mk = self._readn(4) if masked else None
+        payload = self._readn(ln)
+        if not payload:
+            return None
+        if masked and mk:
+            payload = bytearray(b ^ mk[i % 4] for i, b in enumerate(payload))
+        if op == 1:
+            return payload.decode() if isinstance(payload, (bytes, bytearray)) else payload
+        if op == 8:
+            return None
+        if op == 9:
+            self.sock.sendall(bytearray([0x8A, 0x80]) + os.urandom(4))
+            return self.recv()
+        return self.recv()
+
+    def _readn(self, n):
+        d = b''
+        while len(d) < n:
+            c = self.sock.recv(n - len(d))
+            if not c:
+                return None
+            d += c
+        return d
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
 # Windows API with proper 64-bit type declarations
 try:
     user32 = ctypes.windll.user32
@@ -109,7 +200,7 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "5.9"
+VERSION = "5.10"
 WINDOW_TITLE = f"AdsPower Window Manager v{VERSION} - Dev ChingChing"
 CHROME_CLASS = "Chrome_WidgetWin_1"
 
@@ -2325,12 +2416,9 @@ class APMApp:
                 time.sleep(30)
         threading.Thread(target=cache_loop, daemon=True).start()
 
-        if HAS_WS:
-            threading.Thread(target=self._chrome_profile_monitor, daemon=True).start()
-            if self.cfg.get('MAIN', 'AutoProfileSaver', fallback='0') == '1':
-                self._log('Chrome profile auto-saver is ON')
-        else:
-            self._log('websocket-client not installed, Chrome profile auto-saver unavailable')
+        threading.Thread(target=self._chrome_profile_monitor, daemon=True).start()
+        if self.cfg.get('MAIN', 'AutoProfileSaver', fallback='0') == '1':
+            self._log('Chrome profile auto-saver is ON')
 
     def _chrome_profile_monitor(self):
         """Auto-click 'Continue as' button via Chrome DevTools Protocol."""
@@ -2396,7 +2484,7 @@ class APMApp:
         return port
 
     def _try_click_signin(self, debug_port, serial, clicked_targets, verbose=False):
-        """Check browser for signin popup and click accept via CDP."""
+        """Check browser for signin popup and click accept via raw WebSocket CDP."""
         label = f'#{serial}' if serial else f'port {debug_port}'
         found_tid = None
         try:
@@ -2410,16 +2498,15 @@ class APMApp:
                 if 'signin-dice-web-intercept' in t_url and tid not in clicked_targets:
                     ws_url = target.get('webSocketDebuggerUrl', '')
                     self._log(f'[PS] Found bubble for {label}: {t_url[:80]}')
-                    self._log(f'[PS] WS URL: {ws_url[:100] if ws_url else "NONE"}')
                     found_tid = tid
                     if ws_url:
-                        ok, detail = self._cdp_click_accept(ws_url)
+                        ok, detail = self._cdp_click_accept_raw(debug_port, ws_url)
                         if ok:
                             clicked_targets.add(tid)
-                            self._log(f'Chrome profile saved for {label} (direct)')
+                            self._log(f'Chrome profile saved for {label}')
                             return
                         else:
-                            self._log(f'[PS] Direct WS failed: {detail}')
+                            self._log(f'[PS] Direct click failed: {detail}')
                     break
         except Exception as e:
             if verbose:
@@ -2432,40 +2519,40 @@ class APMApp:
                 ver = json.loads(r2.read().decode())
             browser_ws = ver.get('webSocketDebuggerUrl', '')
             if not browser_ws:
-                if verbose:
-                    self._log(f'[PS] No browser WS for port {debug_port}')
                 return
-            ws = _ws_mod.create_connection(browser_ws, timeout=5, suppress_origin=True)
+            browser_path = '/' + browser_ws.replace('ws://', '').split('/', 1)[-1]
+            ws = _RawWS('127.0.0.1', debug_port, browser_path, timeout=5)
+            self._log(f'[PS] Raw WS connected to browser')
             if found_tid and found_tid not in clicked_targets:
-                self._log(f'[PS] M2 attach to known target {found_tid[:16]}')
+                self._log(f'[PS] Attaching to target {found_tid[:16]}')
                 ok = self._cdp_attach_and_click(ws, found_tid, 2)
                 if ok:
                     clicked_targets.add(found_tid)
-                    self._log(f'Chrome profile saved for {label} (M2-direct)')
+                    self._log(f'Chrome profile saved for {label}')
                     ws.close()
                     return
 
             ws.send(json.dumps({'id': 10, 'method': 'Target.getTargets'}))
             result = self._cdp_read_response(ws, 10)
             if not result:
-                self._log(f'[PS] M2 getTargets returned nothing')
+                self._log(f'[PS] getTargets: no response')
                 ws.close()
                 return
             target_infos = result.get('result', {}).get('targetInfos', [])
-            self._log(f'[PS] M2 found {len(target_infos)} targets')
+            self._log(f'[PS] Browser targets: {len(target_infos)}')
             for t in target_infos:
                 t_url = t.get('url', '')
                 tid = t.get('targetId', '')
                 if 'signin-dice-web-intercept' in t_url and tid not in clicked_targets:
-                    self._log(f'[PS] M2 bubble: {t_url[:80]} tid={tid[:16]}')
+                    self._log(f'[PS] Bubble found via browser: {tid[:16]}')
                     ok = self._cdp_attach_and_click(ws, tid, 20)
                     if ok:
                         clicked_targets.add(tid)
-                        self._log(f'Chrome profile saved for {label} (M2-scan)')
+                        self._log(f'Chrome profile saved for {label}')
                     break
             ws.close()
         except Exception as e:
-            self._log(f'[PS] M2 error: {e}')
+            self._log(f'[PS] Browser WS error: {e}')
 
     def _cdp_attach_and_click(self, ws, target_id, base_id):
         """Attach to target via browser WS session and click #accept-button."""
@@ -2486,7 +2573,7 @@ class APMApp:
             if not sid:
                 self._log(f'[PS] attach: no sessionId, resp={str(attach)[:200]}')
                 return False
-            self._log(f'[PS] attached, session={sid[:20]}')
+            self._log(f'[PS] attached session={sid[:20]}')
             js = '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}var all=document.querySelectorAll("button");var names=[];for(var i=0;i<all.length;i++)names.push(all[i].id+":"+all[i].textContent.substring(0,30));return"nf:"+names.join(",")})()'
             ws.send(json.dumps({
                 'id': base_id + 1,
@@ -2502,18 +2589,19 @@ class APMApp:
                 self._log(f'[PS] evaluate error: {ev["error"]}')
                 return False
             val = ev.get('result', {}).get('result', {}).get('value', '')
-            self._log(f'[PS] evaluate result: {val[:100]}')
+            self._log(f'[PS] click result: {val[:100]}')
             return val == 'ok'
         except Exception as e:
             self._log(f'[PS] attach+click error: {e}')
             return False
 
-    def _cdp_click_accept(self, ws_url):
-        """Connect to a target WebSocket and click #accept-button. Returns (success, detail)."""
+    def _cdp_click_accept_raw(self, port, ws_url):
+        """Connect to target via raw WebSocket (no Origin) and click. Returns (success, detail)."""
+        path = '/' + ws_url.replace('ws://', '').split('/', 1)[-1]
         try:
-            ws = _ws_mod.create_connection(ws_url, timeout=3, suppress_origin=True)
+            ws = _RawWS('127.0.0.1', port, path, timeout=3)
         except Exception as e:
-            return False, f'WS connect failed: {e}'
+            return False, f'raw WS failed: {e}'
         try:
             ws.send(json.dumps({
                 'id': 1,
@@ -2522,19 +2610,19 @@ class APMApp:
                     'expression': '(function(){var b=document.querySelector("#accept-button");if(b){b.click();return"ok"}return"nf"})()'
                 }
             }))
-            result = json.loads(ws.recv())
+            raw = ws.recv()
             ws.close()
+            if not raw:
+                return False, 'no response'
+            result = json.loads(raw)
             if 'error' in result:
                 return False, f'CDP error: {result["error"]}'
             val = result.get('result', {}).get('result', {}).get('value', '')
             if val == 'ok':
                 return True, 'clicked'
-            return False, f'button not found, got: {val}'
+            return False, f'result: {val}'
         except Exception as e:
-            try:
-                ws.close()
-            except Exception:
-                pass
+            ws.close()
             return False, f'eval error: {e}'
 
     def _cdp_read_response(self, ws, msg_id):
